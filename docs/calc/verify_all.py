@@ -134,8 +134,12 @@ print(f"     розмах струму намагнічення = {24*(1/(2*F_C)
 
 # ============================================================ 4. LV МІСТ
 hr("4. LV МІСТ: провідникові з самоузгодженим Tj + усі динамічні складові")
-# Оцінки для IRL40SC209 (даталист Infineon віддає 403, звірити вручну!)
-QG12, COSS, CRSS, VF = 300e-9, 4.0e-9, 1.0e-9, 0.90
+# IRL40SC209: Rds(on) 0.59 мОм typ / 0.72 мОм max (кристал "209", як у IRL40T209).
+# Решта - оцінки, масштабовані під великий кристал (даталист віддає 403, звірити вручну!)
+QG12, COSS, CRSS, VF = 500e-9, 8.0e-9, 2.0e-9, 0.90
+# Опір ПЕРВИННОГО КОНТУРУ поза кристалами: шини, паяні зʼєднання, виводи корпусів,
+# шлях до конденсаторного банку. При Rds 0.6 мОм це вже домінуючий член!
+R_INTERCONNECT = 0.30e-3
 def lv_losses(S, m, rds25, rth_jc, T_hs=70.0, rth_pad=0.7, t_dt=60e-9, kT=0.0060, Vg=12.0):
     I = S["Ipri_rms"]; Ipk = S["Ipri_pk"]; V = S["Vnom"]
     Tj = T_hs+20
@@ -152,30 +156,32 @@ def lv_losses(S, m, rds25, rth_jc, T_hs=70.0, rth_pad=0.7, t_dt=60e-9, kT=0.0060
     frac = math.degrees(math.asin(min(1, Izvs/S["n"]/Io_pk)))/90
     Phs = 0.5*Cn*V**2*4*F_C*frac
     dvdt = Ipk/Cn
-    return dict(cond=Pc, dev=Pdev, Tj=Tj, rds=rds, gate=Pg, dt=Pdt, hs=Phs,
-                tot=Pc+Pg+Pdt+Phs+1.0, Izvs=Izvs, frac=frac, dvdt=dvdt,
+    Pint = I**2*R_INTERCONNECT
+    return dict(cond=Pc, dev=Pdev, Tj=Tj, rds=rds, gate=Pg, dt=Pdt, hs=Phs, inter=Pint,
+                tot=Pc+Pg+Pdt+Phs+Pint+1.0, Izvs=Izvs, frac=frac, dvdt=dvdt,
                 miller=m*CRSS*dvdt, Ipk_dev=Ipk/m)
 print("Ключі:")
-print("  IRL40SC209 : StrongIRFET, 40 В, D2PAK-7 (Kelvin source!), Rds(on) max 1.3 мОм @10В")
-print("               (з таблиці Infineon 40V StrongIRFET product brief; Qg/Coss/Rth - оцінки)")
-print("  IRLB3034   : 40 В, TO-220 (БЕЗ Kelvin), Rds(on) max 1.7 мОм - для порівняння")
+print("  IRL40SC209 : StrongIRFET, 40 В, Rds(on) 0.59 мОм typ / 0.72 мОм max @Vgs=10 В")
+print("               (кристал '209'; підтверджено по родинному IRL40T209: 0.59/0.72 мОм)")
+print("  IRLB3034   : 40 В, TO-220, Rds(on) max 1.7 мОм - для порівняння")
 print("  100В/1.5мОм TOLL : гіпотетичний сучасний ключ для 48-вольтової шини")
 print("  Rth: для D2PAK-7 шлях тепла йде через плату -> rth_pad=1.2 K/Вт (теплові перехідні")
 print("       отвори + алюмінієва основа), для TO-220 на радіаторі через прокладку 0.7 K/Вт")
-for S, parts in ((S24, [("IRL40SC209 D2PAK-7", 0.0013, 0.55, 1.2),
-                        ("IRLB3034 TO-220", 0.0017, 0.40, 0.7)]),
-                 (S48, [("IRL40SC209 (40В!)", 0.0013, 0.55, 1.2),
+for S, parts in ((S24, [("IRL40SC209 max 0.72мОм", 0.00072, 0.55, 1.2),
+                        ("IRL40SC209 typ 0.59мОм", 0.00059, 0.55, 1.2),
+                        ("IRLB3034 1.7мОм", 0.0017, 0.40, 0.7)]),
+                 (S48, [("IRL40SC209 (40В!)", 0.00072, 0.55, 1.2),
                         ("100В/1.5мОм TOLL", 0.0015, 0.50, 1.2)])):
     print(f"\n  {S['name'][:2]} I_pri={S['Ipri_rms']:.0f} А RMS / {S['Ipri_pk']:.0f} А пік")
     for pname, r25, rjc, rpad in parts:
         for m in (2, 3, 4):
             L = lv_losses(S, m, r25, rjc, rth_pad=rpad)
-            print(f"    {pname:<26s} m={m}: Rds_hot={L['rds']*1e3:.2f} мОм Tj={L['Tj']:3.0f}°C "
-                  f"| пров.{L['cond']:6.1f} затв.{L['gate']:4.1f} мертв.{L['dt']:4.1f} "
-                  f"жорст.{L['hs']:4.2f} = {L['tot']:6.1f} Вт ({L['tot']/P_OUT*100:.2f}%) "
-                  f"| {L['dev']:4.1f} Вт/ключ, пік {L['Ipk_dev']:.0f} А")
-L = lv_losses(S24, 2, 0.0013, 0.55, rth_pad=1.2)
-print(f"\n  ZVS (варіант A, m=3): I_min={L['Izvs']:.0f} А -> ZVS втрачається лише у "
+            print(f"    {pname:<24s} m={m}: Rds_hot={L['rds']*1e3:.2f}мОм Tj={L['Tj']:3.0f}°C "
+                  f"| кристали{L['cond']:6.1f} шини{L['inter']:5.1f} затв.{L['gate']:4.1f} "
+                  f"мертв.{L['dt']:4.1f} жорст.{L['hs']:4.2f} = {L['tot']:6.1f}Вт "
+                  f"({L['tot']/P_OUT*100:.2f}%) | {L['dev']:4.1f}Вт/ключ")
+L = lv_losses(S24, 2, 0.00072, 0.55, rth_pad=1.2)
+print(f"\n  ZVS (варіант A, IRL40SC209 ПАРНО): I_min={L['Izvs']:.0f} А -> ZVS втрачається лише у "
       f"{L['frac']*100:.0f}% півхвилі, жорсткі втрати {L['hs']:.2f} Вт")
 print(f"  Зворотна проблема: dv/dt={L['dvdt']/1e9:.1f} В/нс -> Miller-струм у затвор "
       f"{L['miller']:.0f} А -> потрібне відʼємне зміщення і/або снабер")
@@ -214,9 +220,9 @@ def total(S, m, r25, rjc, hv_r, hv_par, label, hv_sw=15.0, filt=15.0, bus=10.0, 
     print(f"      з них 'мʼяких' оцінок (±50%): {soft:.0f} Вт -> ККД у діапазоні "
           f"{P_OUT/(P_OUT+tot+soft*0.5)*100:.1f}...{P_OUT/(P_OUT+tot-soft*0.5)*100:.1f}%")
     return tot
-t1 = total(S24, 2, 0.0013, 0.55, 0.019, 1, "A1) 24 В, ПАРНО 8x IRL40SC209, HV C7 19 мОм")
-t2 = total(S24, 3, 0.0013, 0.55, 0.035, 1, "A2) 24 В, ПОТРІЙНО 12x IRL40SC209, HV CFD7 35 мОм")
-t3 = total(S48, 2, 0.0013, 0.55, 0.035, 2, "B1) 48 В*, ПАРНО 8x IRL40SC209, HV 2x CFD7 35 мОм")
+t1 = total(S24, 2, 0.00072, 0.55, 0.019, 1, "A1) 24 В, ПАРНО 8x IRL40SC209, HV C7 19 мОм")
+t2 = total(S24, 2, 0.00072, 0.55, 0.035, 1, "A2) 24 В, ПАРНО 8x IRL40SC209, HV CFD7 35 мОм")
+t3 = total(S48, 2, 0.00072, 0.55, 0.035, 2, "B1) 48 В*, ПАРНО 8x IRL40SC209, HV 2x CFD7 35 мОм")
 t4 = total(S48, 2, 0.0015, 0.50, 0.019, 2, "B2) 48 В, ПАРНО 8x 100В/1.5мОм, HV 2x C7 19 мОм (межа)")
 print("\n  * B1 приведено лише для порівняння опору: IRL40SC209 - 40 В, на 48-вольтовій")
 print("    шині (13s max 54.6 В) він НЕ придатний за напругою.")
@@ -224,11 +230,11 @@ print("    шині (13s max 54.6 В) він НЕ придатний за нап
 hr("7. ЧИ МОЖЛИВІ 99% (30 Вт) - остаточна перевірка")
 best_hv = Io_rms**2*4*(0.019*2.2/2)
 print(f"  Найкращий можливий HV (2x C7 19 мОм паралельно, 4 у шляху): {best_hv:.1f} Вт")
-print(f"  Найкращий реальний LV (48 В, 16 ключів по 1.3 мОм): "
-      f"{lv_losses(S48,4,0.0013,0.55,rth_pad=1.2)['tot']:.1f} Вт")
+print(f"  Найкращий реальний LV (48 В, 8 ключів по 0.72 мОм + шини 0.3 мОм): "
+      f"{lv_losses(S48,2,0.00072,0.55,rth_pad=1.2)['tot']:.1f} Вт")
 print(f"  Трансформатор (найкращий): {S48['Ptx']:.1f} Вт")
 print(f"  Фільтр + шини + аукс (мінімум мінімумів): 20 Вт")
-floor = best_hv+lv_losses(S48,4,0.0013,0.55,rth_pad=1.2)["tot"]+S48["Ptx"]+20
+floor = best_hv+lv_losses(S48,2,0.00072,0.55,rth_pad=1.2)["tot"]+S48["Ptx"]+20
 print(f"  ФІЗИЧНА СТЕЛЯ: {floor:.0f} Вт -> ККД = {P_OUT/(P_OUT+floor)*100:.2f}%")
 print("  99% (30 Вт) недосяжні. Реальна стеля цієї топології - трохи менше 97%.")
 
