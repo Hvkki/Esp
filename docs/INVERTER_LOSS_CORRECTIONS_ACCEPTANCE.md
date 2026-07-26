@@ -39,8 +39,8 @@ Complete current firmware path set and SHA-256 map equality: **PASS**.
 - `firmware/sdkconfig.defaults` — `f2031e8e84a341bd9b1e9a7a6cbf636e275d3badce762b145894813d621189ab`
 
 ## Required artifact hashes
-- `docs/calc/inverter_corrections.py` — `9a9412dcb5189912f9df13374697c1a1c10e6b018186c4ed495806beeb285076`
-- `docs/calc/test_inverter_corrections.py` — `4de097c0f7f2dc16164bb6ef0059c4bf8fc6e474f61feaf9bf3d491372866980`
+- `docs/calc/inverter_corrections.py` — `8f6bcd134628014174546dc4dd1760faec928d7ab8693498ddc78c3e9bbc8809`
+- `docs/calc/test_inverter_corrections.py` — `154203f9e00aac2931a28a7734a581dbf3fac6ce435842a01a480f2509c953ea`
 - `docs/calc/test_inverter_corrections_exploration.py` — `4a6b5cf675f9d18d9944eab759b90922caaddc8090eeeabfec6c149a8cbf5fdf`
 - `docs/calc/inverter_corrections_preservation.py` — `7ce9d0d9413cabe6adc063f6b5facb3b4e7491930582b9bacb9471981f451edd`
 - `docs/calc/inverter_corrections_preservation_enforced.py` — `d515641a66c16ad03324edcf27548c93cf0dcfdb6cf76a55ba57fd60a2c8b92e`

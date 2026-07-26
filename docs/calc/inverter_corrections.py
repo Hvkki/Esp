@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import struct
+from collections import namedtuple
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from enum import Enum
 from fractions import Fraction
@@ -157,24 +158,50 @@ def canonical_events(events: Iterable[CanonicalEvent]) -> tuple[CanonicalEvent, 
     return result
 
 
-@dataclass(frozen=True)
-class GateAuthorization:
-    gate: GateIdentity
-    operation: str
-    valid: bool
-    permitted_ineligibility: bool = False
-    completion_claim: bool = False
-    pass_claim: bool = False
-    success_claim: bool = False
-    diagnostic: Optional[str] = None
-    synthetic_provenance: bool = False
+_GATE_AUTHORIZATION_FIELDS = (
+    "gate", "operation", "valid", "permitted_ineligibility",
+    "completion_claim", "pass_claim", "success_claim", "diagnostic",
+    "synthetic_provenance",
+)
+_GateAuthorizationTuple = namedtuple(
+    "GateAuthorization", _GATE_AUTHORIZATION_FIELDS,
+    defaults=(False, False, False, False, None, False),
+)
 
-    def __post_init__(self) -> None:
-        _gate_authorization_state(self)
+
+class GateAuthorization(_GateAuthorizationTuple):
+    """Closed positional authorization record with immutable trusted state."""
+
+    __slots__ = ()
+
+    def __new__(
+        cls,
+        gate: GateIdentity,
+        operation: str,
+        valid: bool,
+        permitted_ineligibility: bool = False,
+        completion_claim: bool = False,
+        pass_claim: bool = False,
+        success_claim: bool = False,
+        diagnostic: Optional[str] = None,
+        synthetic_provenance: bool = False,
+    ) -> "GateAuthorization":
+        values = (
+            gate, operation, valid, permitted_ineligibility,
+            completion_claim, pass_claim, success_claim, diagnostic,
+            synthetic_provenance,
+        )
+        if (type(gate) is not GateIdentity
+                or type(operation) is not str or not operation
+                or any(type(values[index]) is not bool
+                       for index in (2, 3, 4, 5, 6, 8))
+                or (diagnostic is not None and type(diagnostic) is not str)):
+            raise ValueError("GATE_AUTHORIZATION_STATE_INVALID")
+        return tuple.__new__(cls, values)
 
     @property
     def synthetic_only(self) -> bool:
-        """Compatibility name backed by validated immutable instance state."""
+        """Compatibility name backed by validated immutable tuple state."""
         return _gate_authorization_state(self)["synthetic_provenance"]
 
     def authorizes(self, operation: str) -> bool:
@@ -182,38 +209,48 @@ class GateAuthorization:
             _gate_authorization_state(self), operation)
 
 
-def _gate_authorization_state(authorization: Any) -> Mapping[str, Any]:
-    """Snapshot authorization state without invoking class descriptors/methods."""
-    if type(authorization) is not GateAuthorization:
-        raise ValueError("GATE_AUTHORIZATION_EXACT_TYPE_REQUIRED")
-    state = object.__getattribute__(authorization, "__dict__")
-    expected = {"gate", "operation", "valid", "permitted_ineligibility",
-                "completion_claim", "pass_claim", "success_claim",
-                "diagnostic", "synthetic_provenance"}
-    if type(state) is not dict or set(state) != expected:
-        raise ValueError("GATE_AUTHORIZATION_STATE_INVALID")
-    snapshot = dict(state)
-    if (type(snapshot["gate"]) is not GateIdentity
-            or type(snapshot["operation"]) is not str
-            or not snapshot["operation"]
-            or any(type(snapshot[name]) is not bool for name in
-                   ("valid", "permitted_ineligibility", "completion_claim",
-                    "pass_claim", "success_claim", "synthetic_provenance"))
-            or (snapshot["diagnostic"] is not None
-                and type(snapshot["diagnostic"]) is not str)):
-        raise ValueError("GATE_AUTHORIZATION_STATE_INVALID")
-    return MappingProxyType(snapshot)
+def _capture_gate_authorization_helpers(
+    authorization_type: type,
+    gate_type: type,
+    field_names: tuple[str, ...],
+) -> tuple[Callable[[Any], Mapping[str, Any]],
+           Callable[[Mapping[str, Any], str], bool]]:
+    """Close trusted readers over identities that module rebinding cannot alter."""
+    names = tuple(field_names)
+
+    def state(authorization: Any) -> Mapping[str, Any]:
+        if type(authorization) is not authorization_type:
+            raise ValueError("GATE_AUTHORIZATION_EXACT_TYPE_REQUIRED")
+        values = tuple(tuple.__getitem__(authorization, index)
+                       for index in range(len(names)))
+        snapshot = dict(zip(names, values))
+        if (type(snapshot["gate"]) is not gate_type
+                or type(snapshot["operation"]) is not str
+                or not snapshot["operation"]
+                or any(type(snapshot[name]) is not bool for name in
+                       ("valid", "permitted_ineligibility", "completion_claim",
+                        "pass_claim", "success_claim", "synthetic_provenance"))
+                or (snapshot["diagnostic"] is not None
+                    and type(snapshot["diagnostic"]) is not str)):
+            raise ValueError("GATE_AUTHORIZATION_STATE_INVALID")
+        return MappingProxyType(snapshot)
+
+    def authorizes(state_snapshot: Mapping[str, Any], operation: str) -> bool:
+        if not state_snapshot["valid"] or state_snapshot["operation"] != operation:
+            return False
+        if state_snapshot["permitted_ineligibility"]:
+            return (operation == "PROGRESS_TO_REALISTIC_COMPARISON"
+                    and not any(state_snapshot[name] for name in
+                                ("completion_claim", "pass_claim",
+                                 "success_claim")))
+        return True
+
+    return state, authorizes
 
 
-def _gate_authorization_authorizes(state: Mapping[str, Any],
-                                    operation: str) -> bool:
-    if not state["valid"] or state["operation"] != operation:
-        return False
-    if state["permitted_ineligibility"]:
-        return (operation == "PROGRESS_TO_REALISTIC_COMPARISON"
-                and not any(state[name] for name in
-                            ("completion_claim", "pass_claim", "success_claim")))
-    return True
+_gate_authorization_state, _gate_authorization_authorizes = (
+    _capture_gate_authorization_helpers(
+        GateAuthorization, GateIdentity, _GATE_AUTHORIZATION_FIELDS))
 
 
 @dataclass(frozen=True)

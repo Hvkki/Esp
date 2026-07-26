@@ -85,9 +85,9 @@ class CanonicalAndMaterialTests(unittest.TestCase):
             result=realistic_comparison_result(2,[req],evidence,conditions,[complete,ineligible])
             self.assertEqual(result.availability,expected)
         self.assertFalse(ineligible.completion_claim or ineligible.pass_claim or ineligible.success_claim)
-        blocked=realistic_comparison_result(2,[req],True,True,[replace(ineligible,valid=False)])
+        blocked=realistic_comparison_result(2,[req],True,True,[ineligible._replace(valid=False)])
         self.assertEqual(blocked.availability,Availability.UNAVAILABLE)
-        unrelated=derive_result([req],3,direct_evidence_complete=True,local_conditions_satisfied=True,gate_authorizations=[replace(ineligible,valid=False)],operation="PROGRESS_TO_REALISTIC_COMPARISON",unrelated=True)
+        unrelated=derive_result([req],3,direct_evidence_complete=True,local_conditions_satisfied=True,gate_authorizations=[ineligible._replace(valid=False)],operation="PROGRESS_TO_REALISTIC_COMPARISON",unrelated=True)
         self.assertEqual(unrelated.availability,Availability.AVAILABLE)
 
     def test_dependency_hash_change_stales_transitive_descendants(self):
@@ -705,20 +705,53 @@ class IndependentReviewRegressionTests(unittest.TestCase):
                 {"synthetic-node":(),"wrapper":("synthetic-node",)},
                 {"synthetic-node":synthetic_node,"wrapper":laundering_wrapper})
 
-    def test_gate_authorization_descriptors_cannot_launder_trust_state(self):
+    def test_gate_authorization_state_is_structurally_immutable_and_closed(self):
         """**Validates: Requirements 2.39, 2.41**"""
         authorization=GateAuthorization(GateIdentity.CONTROLLED_THREEFOLD,
             "PROGRESS_TO_REALISTIC_COMPARISON",True,
             synthetic_provenance=True)
-        class ForgedAuthorization(GateAuthorization):
+        self.assertIsInstance(authorization,tuple)
+        self.assertFalse(hasattr(authorization,"__dict__"))
+        self.assertEqual(tuple(authorization),(
+            GateIdentity.CONTROLLED_THREEFOLD,
+            "PROGRESS_TO_REALISTIC_COMPARISON",True,False,False,False,False,
+            None,True))
+        with self.assertRaises(AttributeError):
+            authorization.valid=False
+        with self.assertRaises(AttributeError):
+            object.__setattr__(authorization,"synthetic_provenance",False)
+        with self.assertRaises(TypeError):
+            authorization[2]=False
+        state=corrections._gate_authorization_state(authorization)
+        self.assertTrue(state["valid"])
+        self.assertTrue(state["synthetic_provenance"])
+        with self.assertRaises(TypeError):
+            state["valid"]=False
+
+    def test_gate_authorization_descriptors_and_rebinding_cannot_launder_trust(self):
+        """**Validates: Requirements 2.39, 2.41**"""
+        original_type=corrections.GateAuthorization
+        authorization=original_type(GateIdentity.CONTROLLED_THREEFOLD,
+            "PROGRESS_TO_REALISTIC_COMPARISON",True,
+            synthetic_provenance=True)
+
+        class ForgedAuthorization(original_type):
             pass
-        forged=object.__new__(ForgedAuthorization)
-        for name,value in object.__getattribute__(authorization,"__dict__").items():
-            object.__setattr__(forged,name,value)
-        original_descriptor=GateAuthorization.synthetic_provenance
+
+        forged=ForgedAuthorization(*tuple(authorization))
+
+        class CraftedAuthorization(tuple):
+            valid=property(lambda self: True)
+            synthetic_provenance=property(lambda self: False)
+
+        crafted=CraftedAuthorization(tuple(authorization))
+        original_synthetic_descriptor=original_type.synthetic_provenance
+        original_valid_descriptor=original_type.valid
         try:
-            GateAuthorization.synthetic_provenance=property(lambda self: False)
+            original_type.synthetic_provenance=property(lambda self: False)
+            original_type.valid=property(lambda self: False)
             self.assertFalse(authorization.synthetic_provenance)
+            self.assertFalse(authorization.valid)
             self.assertTrue(authorization.synthetic_only)
             self.assertTrue(authorization.authorizes(
                 "PROGRESS_TO_REALISTIC_COMPARISON"))
@@ -737,13 +770,27 @@ class IndependentReviewRegressionTests(unittest.TestCase):
             self.assertTrue(claim.synthetic_provenance)
             self.assertTrue(claim.non_gating)
 
-            class_result=realistic_comparison_result(1,(),True,True,(forged,))
-            self.assertEqual(class_result.availability,Availability.UNAVAILABLE)
-            self.assertTrue(class_result.non_gating)
-            self.assertIn("INVALID_WORKFLOW_AUTHORIZATION",
-                          class_result.diagnostics)
+            for rebound,untrusted in ((ForgedAuthorization,forged),
+                                      (CraftedAuthorization,crafted)):
+                corrections.GateAuthorization=rebound
+                original_result=realistic_comparison_result(
+                    1,(),True,True,(authorization,),real_claim=True)
+                self.assertEqual(original_result.availability,
+                                 Availability.UNAVAILABLE)
+                self.assertTrue(original_result.synthetic_provenance)
+                self.assertTrue(original_result.non_gating)
+
+                forged_result=realistic_comparison_result(
+                    1,(),True,True,(untrusted,))
+                self.assertEqual(forged_result.availability,
+                                 Availability.UNAVAILABLE)
+                self.assertTrue(forged_result.non_gating)
+                self.assertIn("INVALID_WORKFLOW_AUTHORIZATION",
+                              forged_result.diagnostics)
         finally:
-            GateAuthorization.synthetic_provenance=original_descriptor
+            corrections.GateAuthorization=original_type
+            original_type.synthetic_provenance=original_synthetic_descriptor
+            original_type.valid=original_valid_descriptor
 
     def test_repository_constants_cannot_mint_or_modify_grants(self):
         """Copied metadata, hashes, and every public constant are not authority."""
