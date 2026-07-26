@@ -2724,6 +2724,7 @@ def digital_oracle(p: int, polarity: int = 1) -> TimingVector:
 # identity only; they do not confer owner approval or registration authority.
 import hmac
 import secrets
+from types import MappingProxyType
 
 
 @dataclass(frozen=True)
@@ -2876,20 +2877,29 @@ _SYNTHETIC_FIXTURE_GRANTS = (
     ("THERMAL-DYNAMIC-001", "1", "THERMAL_DYNAMIC_INPUT", "251973615cc988242118d3b9bcb8d377260e0a6956a287b5602729870995e71e"),
     ("UNRELATED", "1", "CONTROLLED_PREREQUISITES", "68a649543b13a902a0bc67f5870c7a74807994b8e43dd8e5a46ee6179f40c83c"),
 )
-_FIXED_TRUST_ROOTS = {
-    "INVERTER-ARTIFACT-TRUST-ROOT": {
-        "version":"1.0.0", "grants":(),
-        "signature":_EMPTY_TRUST_ROOT_SIGNATURE,
-        "root_hash":"7f1ebf07bca0311dc0ccb443e170b3ba0e4dc0f63714beadf4ff020945e353dc",
-        "synthetic_only":False,
-    },
-    "INVERTER-SYNTHETIC-FIXTURE-TRUST-ROOT": {
-        "version":"1.0.0", "grants":_SYNTHETIC_FIXTURE_GRANTS,
-        "signature":_SYNTHETIC_FIXTURE_TRUST_ROOT_SIGNATURE,
-        "root_hash":"91d172d5758bb41e1698993b45684f25ba4e32b3fb396708ad61ad2eba32c628",
-        "synthetic_only":True,
-    },
-}
+@dataclass(frozen=True)
+class _FixedTrustRootManifest:
+    version: str
+    grants: tuple[tuple[str, str, str, str], ...]
+    signature: str
+    root_hash: str
+
+
+# These records contain only authenticated manifest material. Trust classification
+# is intentionally absent: it is derived from root_id, which is part of the signed
+# payload, so no mutable side-band flag can relabel synthetic authorization.
+_FIXED_TRUST_ROOTS: Mapping[str, _FixedTrustRootManifest] = MappingProxyType({
+    "INVERTER-ARTIFACT-TRUST-ROOT": _FixedTrustRootManifest(
+        version="1.0.0", grants=(),
+        signature=_EMPTY_TRUST_ROOT_SIGNATURE,
+        root_hash="7f1ebf07bca0311dc0ccb443e170b3ba0e4dc0f63714beadf4ff020945e353dc",
+    ),
+    "INVERTER-SYNTHETIC-FIXTURE-TRUST-ROOT": _FixedTrustRootManifest(
+        version="1.0.0", grants=_SYNTHETIC_FIXTURE_GRANTS,
+        signature=_SYNTHETIC_FIXTURE_TRUST_ROOT_SIGNATURE,
+        root_hash="91d172d5758bb41e1698993b45684f25ba4e32b3fb396708ad61ad2eba32c628",
+    ),
+})
 
 
 @dataclass(frozen=True)
@@ -2905,8 +2915,14 @@ class ArtifactTrustRoot:
 
     @property
     def synthetic_only(self) -> bool:
-        manifest = _FIXED_TRUST_ROOTS.get(self.root_id)
-        return bool(manifest and manifest["synthetic_only"])
+        # root_id is immutable on this frozen object and authenticated by the
+        # authority signature below. Keep the closed classification literal here
+        # so replacement of the manifest lookup cannot relabel an existing root.
+        if self.root_id == "INVERTER-ARTIFACT-TRUST-ROOT":
+            return False
+        if self.root_id == "INVERTER-SYNTHETIC-FIXTURE-TRUST-ROOT":
+            return True
+        raise ValueError("ARTIFACT_TRUST_ROOT_CLASSIFICATION_INVALID")
 
     def validate(self) -> None:
         expected_policies = tuple(sorted((kind, owner, approval)
@@ -2923,12 +2939,19 @@ class ArtifactTrustRoot:
         signature_valid = (0 < signature < _TRUST_ROOT_RSA_N
                            and pow(signature, _TRUST_ROOT_RSA_E,
                                    _TRUST_ROOT_RSA_N) == int(content_hash(payload), 16))
-        exact_manifest = (manifest is not None
-            and self.version == manifest["version"]
-            and self.grants == manifest["grants"]
-            and self.authority_signature == manifest["signature"]
-            and self.root_hash == manifest["root_hash"])
+        exact_manifest = (isinstance(manifest, _FixedTrustRootManifest)
+            and self.version == manifest.version
+            and self.grants == manifest.grants
+            and self.authority_signature == manifest.signature
+            and self.root_hash == manifest.root_hash)
+        try:
+            # Validation must cover the classification path as well as grants.
+            # synthetic_only is derived solely from the signed root_id.
+            classification_valid = type(self.synthetic_only) is bool
+        except ValueError:
+            classification_valid = False
         if (not exact_manifest
+                or not classification_valid
                 or self.authority != "RepositoryTrustAdministrator"
                 or self.approval != "TRUST_ROOT_APPROVED"
                 or self.policies != expected_policies
@@ -2957,10 +2980,10 @@ def _fixed_trust_root(root_id: str) -> ArtifactTrustRoot:
     manifest = _FIXED_TRUST_ROOTS[root_id]
     policies = tuple(sorted((kind, owner, status)
                             for kind, (owner, status) in _TRUST_POLICIES.items()))
-    root = ArtifactTrustRoot(root_id, manifest["version"],
+    root = ArtifactTrustRoot(root_id, manifest.version,
         "RepositoryTrustAdministrator", "TRUST_ROOT_APPROVED",
-        manifest["grants"], policies, manifest["signature"],
-        manifest["root_hash"])
+        manifest.grants, policies, manifest.signature,
+        manifest.root_hash)
     root.validate()
     return root
 

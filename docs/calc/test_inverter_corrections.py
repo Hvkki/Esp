@@ -17,6 +17,7 @@ CALC = Path(__file__).resolve().parent
 ROOT = CALC.parents[1]
 if str(CALC) not in sys.path: sys.path.insert(0,str(CALC))
 
+import inverter_corrections as corrections
 from inverter_corrections import *
 
 def temperatures(): return {n:25.0 for n in THERMAL_NODES}
@@ -609,6 +610,51 @@ class IndependentReviewRegressionTests(unittest.TestCase):
         authorizations,diagnostics=validate_comparison_registry(forged_comparison)
         self.assertIn("COMPARISON_PREREQUISITE_REGISTRY_INVALID",diagnostics)
         self.assertTrue(all(not authorization.valid for authorization in authorizations))
+
+    def test_trust_root_classification_is_authenticated_and_not_launderable(self):
+        """**Validates: Requirements 2.39, 2.41**"""
+        root=synthetic_fixture_trust_root()
+        root.validate()
+        self.assertTrue(root.synthetic_only)
+
+        # The published manifest table and each record reject in-place mutation.
+        with self.assertRaises(TypeError):
+            corrections._FIXED_TRUST_ROOTS[root.root_id]=corrections._FIXED_TRUST_ROOTS[root.root_id]
+        with self.assertRaises((AttributeError,TypeError)):
+            corrections._FIXED_TRUST_ROOTS[root.root_id].root_hash="0"*64
+
+        # Replacing the module lookup with the old mutable shape cannot relabel an
+        # already authenticated root; validation fails closed while it is replaced.
+        original_manifests=corrections._FIXED_TRUST_ROOTS
+        manifest=original_manifests[root.root_id]
+        try:
+            corrections._FIXED_TRUST_ROOTS={root.root_id:{
+                "version":manifest.version,"grants":manifest.grants,
+                "signature":manifest.signature,"root_hash":manifest.root_hash,
+                "synthetic_only":False}}
+            self.assertTrue(root.synthetic_only)
+            with self.assertRaisesRegex(ValueError,"ARTIFACT_TRUST_ROOT_INVALID"):
+                root.validate()
+            with self.assertRaisesRegex(ValueError,"ARTIFACT_TRUST_ROOT_INVALID"):
+                ArtifactRegistry({}, {}, {}, root)
+        finally:
+            corrections._FIXED_TRUST_ROOTS=original_manifests
+
+        # root_id carries classification in the signed payload. Changing it can
+        # produce a non-synthetic-looking object, but never a trusted one.
+        relabeled=replace(root,root_id="INVERTER-ARTIFACT-TRUST-ROOT")
+        self.assertFalse(relabeled.synthetic_only)
+        with self.assertRaisesRegex(ValueError,"ARTIFACT_TRUST_ROOT_INVALID"):
+            relabeled.validate()
+
+        registry=valid_registry()
+        authorizations,diagnostics=validate_comparison_registry(registry)
+        self.assertFalse(diagnostics)
+        self.assertTrue(all(a.synthetic_only for a in authorizations))
+        claim=realistic_comparison_result(1,[material_result(1)],True,True,
+                                           authorizations,real_claim=True)
+        self.assertEqual(claim.availability,Availability.UNAVAILABLE)
+        self.assertTrue(claim.non_gating)
 
     def test_synthetic_provenance_is_immutable_transitive_and_not_launderable(self):
         synthetic=material_result(1,synthetic_provenance=True)
