@@ -1,0 +1,66 @@
+{
+  "pbtResults": {
+    "1. Freeze the unfixed baseline and write the bug-condition exploration test": {
+      "status": "passed",
+      "failingExample": "FROZEN_BASELINE_COUNTEREXAMPLES=[{\"fixture_id\":\"EVID-SC209-060\",\"bug_condition_branch\":\"evidenceClassOrConflictContractInvalid\",\"exact_failure\":\"expectedBehavior(result) is false on frozen baseline\"},{\"fixture_id\":\"TIMING-P10\",\"bug_condition_branch\":\"digitalTimingDiffersFromFixedOracle\",\"exact_failure\":\"expectedBehavior(result) is false on frozen baseline\"},{\"fixture_id\":\"NOLOAD-LOADED-CONSTANTS\",\"bug_condition_branch\":\"staleRoundedOrUnsupportedResultPublished\",\"exact_failure\":\"expectedBehavior(result) is false on frozen baseline\"},{\"fixture_id\":\"QUAL-48-INCOMPLETE\",\"bug_condition_branch\":\"syntheticEvidenceSupportsRealClaim\",\"exact_failure\":\"expectedBehavior(result) is false on frozen baseline\"}]",
+      "lastRunTimestamp": 1785063553308
+    },
+    "3.9 Implement orthogonal firmware-implementation and hardware-measurement status": {
+      "status": "passed",
+      "lastRunTimestamp": 1785064040313
+    },
+    "2. Execute the frozen observation-first preservation suite on the unfixed baseline": {
+      "status": "passed",
+      "lastRunTimestamp": 1785064037508
+    },
+    "3.1 Implement canonical values/events, `MaterialResult`, trace freshness, and ATS-v2": {
+      "status": "passed",
+      "lastRunTimestamp": 1785064037902
+    },
+    "3.2 Implement evidence metadata, conflict transitions, selection, and invalidation": {
+      "status": "passed",
+      "lastRunTimestamp": 1785064038118
+    },
+    "3.3 Implement the exact 2.36 digital oracle and independent analog MODREF handling": {
+      "status": "passed",
+      "lastRunTimestamp": 1785064038509
+    },
+    "3.4 Implement typed residual ownership, settling, and no-load classification": {
+      "status": "passed",
+      "lastRunTimestamp": 1785064038712
+    },
+    "3.5 Implement the closed inverter-domain inventory and exact isolation": {
+      "status": "passed",
+      "lastRunTimestamp": 1785064039116
+    },
+    "3.6 Implement cold, dynamic, steady, and optional root-verification thermal APIs": {
+      "status": "passed",
+      "lastRunTimestamp": 1785064039315
+    },
+    "3.7 Implement the closed comparison gates before realistic common-Tref comparison": {
+      "status": "passed",
+      "lastRunTimestamp": 1785064039713
+    },
+    "3.8 Implement synthetic/real qualification isolation and incomplete-48-V handling": {
+      "status": "passed",
+      "lastRunTimestamp": 1785064039919
+    },
+    "3.10 Implement publication, stale-result, and unsupported-claim gates": {
+      "status": "passed",
+      "lastRunTimestamp": 1785064040526
+    },
+    "3.12 Re-run the original bug-condition exploration test": {
+      "status": "passed",
+      "lastRunTimestamp": 1785065366470
+    },
+    "3.13 Re-run the frozen preservation suite": {
+      "status": "passed",
+      "lastRunTimestamp": 1785064041121
+    },
+    "4. Checkpoint - Capture final firmware hashes and enforce acceptance": {
+      "status": "passed",
+      "lastRunTimestamp": 1785064041296
+    }
+  },
+  "executionHistory": {}
+}
