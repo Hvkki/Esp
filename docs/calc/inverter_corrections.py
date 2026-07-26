@@ -1185,7 +1185,7 @@ def validate_comparison_registry(t_ref: Mapping[str,Any], artifacts: Sequence[Ma
 def realistic_comparison_result(local_value: Any, local_inputs: Sequence[MaterialResult], direct_evidence_complete: bool,
                                 local_conditions_satisfied: bool, authorizations: Sequence[GateAuthorization],
                                 *, real_claim: bool = False) -> MaterialResult:
-    synthetic = (any(auth.synthetic_only for auth in authorizations)
+    synthetic = (any(auth.synthetic_provenance for auth in authorizations)
                  or any(getattr(item, "synthetic_provenance", False)
                         for item in local_inputs))
     if real_claim and synthetic:
@@ -2473,7 +2473,8 @@ def validate_comparison_registry(registry: Any, artifacts: Sequence[Mapping[str,
         gate=GateIdentity(artifact["gate"]); outcome=artifact["outcomes"][0]; ineligible=outcome["kind"]=="INELIGIBILITY"
         auth.append(GateAuthorization(gate,"PROGRESS_TO_REALISTIC_COMPARISON",True,ineligible,
                                       outcome.get("completion_claim",False),outcome.get("pass_claim",False),outcome.get("success_claim",False),
-                                      synthetic_provenance=registry.prerequisite_registry.trust_root.synthetic_only))
+                                      synthetic_provenance=_authenticated_trust_root_classification(
+                                          registry.prerequisite_registry.trust_root)))
     return tuple(sorted(auth,key=lambda x:x.gate.value)),()
 
 
@@ -2503,7 +2504,7 @@ def thermal_transient(temperatures: Mapping[str,float], domains: Mapping[str,tup
             result[node]=temperatures[node]+elapsed*float(c["applied_power"][node])/cth[node]
             if not domains[node][0]<=result[node]<=domains[node][1]:
                 return material_result(ExplicitAbsence((node,),"thermal domain exit"),Availability.UNAVAILABLE,diagnostics=("THERMAL_DOMAIN_EXIT",),non_gating=True)
-        return material_result({"mode":"HOT_START_TRANSIENT" if hot_start else "TRANSIENT","temperatures":result,"elapsed":elapsed},dependency_records={artifact.artifact_id:artifact.artifact_hash},non_gating=trust_root.synthetic_only,synthetic_provenance=trust_root.synthetic_only)
+        return material_result({"mode":"HOT_START_TRANSIENT" if hot_start else "TRANSIENT","temperatures":result,"elapsed":elapsed},dependency_records={artifact.artifact_id:artifact.artifact_hash},non_gating=_authenticated_trust_root_classification(trust_root),synthetic_provenance=_authenticated_trust_root_classification(trust_root))
     except Exception as exc:
         return material_result(ExplicitAbsence(("dynamic_thermal_data",),str(exc)),Availability.UNAVAILABLE,diagnostics=("THERMAL_DYNAMICS_UNAVAILABLE",),non_gating=True)
 
@@ -2568,7 +2569,7 @@ def qualification_result(graph: Mapping[str,Any], *, real_claim: bool,
         if synthetic and real_claim: raise ValueError("synthetic fixture cannot support real claim")
         if registry is None: raise ValueError("trusted registry required")
         registry, trust_root = _require_exact_registry(registry)
-        if trust_root.synthetic_only and not synthetic:
+        if _authenticated_trust_root_classification(trust_root) and not synthetic:
             raise ValueError("synthetic fixture trust root requires synthetic marker")
         if set(graph)!=required_graph or set(graph["limit_refs"])!=set(QUALIFICATION_LIMITS): raise ValueError("qualification graph schema")
         failed=[]; deps={}
@@ -2587,7 +2588,7 @@ def qualification_result(graph: Mapping[str,Any], *, real_claim: bool,
             passed=observed<=c["value"] if c["pass_rule"]=="<=" else observed>=c["value"] if c["pass_rule"]==">=" else False
             if not passed: failed.append(name)
             deps[artifact.artifact_id]=artifact.artifact_hash
-        return material_result({"qualified":not failed,"failed":failed,"exact_device":graph["exact_device"]},dependency_records=deps,non_gating=synthetic,synthetic_provenance=trust_root.synthetic_only or synthetic)
+        return material_result({"qualified":not failed,"failed":failed,"exact_device":graph["exact_device"]},dependency_records=deps,non_gating=synthetic,synthetic_provenance=_authenticated_trust_root_classification(trust_root) or synthetic)
     except Exception as exc:
         diagnostic=("SYNTHETIC_REAL_MIX" if "synthetic-real" in str(exc) else
                     "SYNTHETIC_PUBLICATION_REJECTED" if "synthetic fixture" in str(exc) else
@@ -2617,7 +2618,7 @@ def control_axis_status(axis: str, evidence: Optional[Mapping[str,Any]],
             test=registry.resolve(evidence["test_ref"],"HARDWARE_CONTROL_TEST",_HW_CONTROL_SCHEMA); c=test.content
             if not all(c[k] for k in ("exact_hardware_identity","firmware_config_hash","instruments_calibration","conditions","waveform_coverage","limits","requirement")): raise ValueError("hardware content incomplete")
             passed=c["passed"] is True; deps={test.artifact_id:test.artifact_hash}
-        return material_result(ControlStatus.VERIFIED.value if passed else ControlStatus.UNVERIFIED.value,Availability.AVAILABLE,dependency_records=deps,diagnostics=() if passed else ("named verification predicate failed",),non_gating=trust_root.synthetic_only,synthetic_provenance=trust_root.synthetic_only,suffix=axis)
+        return material_result(ControlStatus.VERIFIED.value if passed else ControlStatus.UNVERIFIED.value,Availability.AVAILABLE,dependency_records=deps,diagnostics=() if passed else ("named verification predicate failed",),non_gating=_authenticated_trust_root_classification(trust_root),synthetic_provenance=_authenticated_trust_root_classification(trust_root),suffix=axis)
     except Exception as exc:
         return material_result(ControlStatus.UNAVAILABLE.value,Availability.UNAVAILABLE,diagnostics=(str(exc),),non_gating=True,suffix=axis)
 
@@ -2637,7 +2638,7 @@ def publish(claim: Mapping[str,Any], material: MaterialResult, *, real_claim: bo
         if registry is None or result_id is None: raise ValueError("fresh registered result required")
         registry, trust_root = _require_exact_registry(registry)
         if not registry.validate_current(result_id): raise ValueError("fresh registered result required")
-        if real_claim and (trust_root.synthetic_only or material.synthetic_provenance):
+        if real_claim and (_authenticated_trust_root_classification(trust_root) or material.synthetic_provenance):
             raise ValueError("synthetic provenance cannot support a real claim")
         if registry.results[result_id] != material: raise ValueError("material/result mismatch")
         if set(claim)!=PUBLICATION_FIELDS|{"publication_context_ref"}: raise ValueError("publication schema must be exact")
@@ -2670,7 +2671,7 @@ def publish(claim: Mapping[str,Any], material: MaterialResult, *, real_claim: bo
     if diagnostics:
         return material_result(ExplicitAbsence(tuple(diagnostics),"publication rejected"),Availability.UNAVAILABLE,diagnostics=("PUBLICATION_REJECTED",))
     assert registry is not None
-    return material_result(copy.deepcopy(dict(claim)),material.availability,dependencies=(material,),non_gating=trust_root.synthetic_only,synthetic_provenance=material.synthetic_provenance,suffix="published")
+    return material_result(copy.deepcopy(dict(claim)),material.availability,dependencies=(material,),non_gating=_authenticated_trust_root_classification(trust_root),synthetic_provenance=material.synthetic_provenance,suffix="published")
 
 
 
@@ -2915,65 +2916,89 @@ class ArtifactTrustRoot:
 
     @property
     def synthetic_only(self) -> bool:
-        # root_id is immutable on this frozen object and authenticated by the
-        # authority signature below. Keep the closed classification literal here
-        # so replacement of the manifest lookup cannot relabel an existing root.
-        if self.root_id == "INVERTER-ARTIFACT-TRUST-ROOT":
-            return False
-        if self.root_id == "INVERTER-SYNTHETIC-FIXTURE-TRUST-ROOT":
-            return True
-        raise ValueError("ARTIFACT_TRUST_ROOT_CLASSIFICATION_INVALID")
+        """Compatibility display backed by authenticated instance state."""
+        return _authenticated_trust_root_classification(self)
 
     def validate(self) -> None:
-        expected_policies = tuple(sorted((kind, owner, approval)
-                                         for kind, (owner, approval)
-                                         in _TRUST_POLICIES.items()))
-        manifest = _FIXED_TRUST_ROOTS.get(self.root_id)
-        payload = {"root_id": self.root_id, "version": self.version,
-                   "authority": self.authority, "approval": self.approval,
-                   "grants": list(self.grants), "policies": list(self.policies)}
-        try:
-            signature = int(self.authority_signature, 16)
-        except (TypeError, ValueError):
-            signature = -1
-        signature_valid = (0 < signature < _TRUST_ROOT_RSA_N
-                           and pow(signature, _TRUST_ROOT_RSA_E,
-                                   _TRUST_ROOT_RSA_N) == int(content_hash(payload), 16))
-        exact_manifest = (isinstance(manifest, _FixedTrustRootManifest)
-            and self.version == manifest.version
-            and self.grants == manifest.grants
-            and self.authority_signature == manifest.signature
-            and self.root_hash == manifest.root_hash)
-        try:
-            # Validation must cover the classification path as well as grants.
-            # synthetic_only is derived solely from the signed root_id.
-            classification_valid = type(self.synthetic_only) is bool
-        except ValueError:
-            classification_valid = False
-        if (not exact_manifest
-                or not classification_valid
-                or self.authority != "RepositoryTrustAdministrator"
-                or self.approval != "TRUST_ROOT_APPROVED"
-                or self.policies != expected_policies
-                or tuple(sorted(set(self.grants))) != self.grants
-                or self.root_hash != content_hash({**payload,
-                    "authority_signature":self.authority_signature})
-                or not signature_valid):
-            raise ValueError("ARTIFACT_TRUST_ROOT_INVALID")
+        _authenticated_trust_root_classification(self)
 
     def authorizes(self, artifact: RegisteredArtifact) -> bool:
-        if type(self) is not ArtifactTrustRoot:
-            return False
-        try:
-            self.validate()
-            artifact.validate_identity()
-        except (TypeError, ValueError):
-            return False
-        policy = _TRUST_POLICIES.get(artifact.artifact_type)
-        identity = (artifact.artifact_id, artifact.version,
-                    artifact.artifact_type, artifact.artifact_hash)
-        return (policy == (artifact.owner, artifact.approval)
-                and identity in self.grants)
+        return _trust_root_authorizes(self, artifact)
+
+
+def _trust_root_state(trust_root: Any) -> Mapping[str, Any]:
+    """Read signed dataclass state without consulting replaceable descriptors."""
+    if type(trust_root) is not ArtifactTrustRoot:
+        raise ValueError("ARTIFACT_TRUST_ROOT_EXACT_TYPE_REQUIRED")
+    state = object.__getattribute__(trust_root, "__dict__")
+    expected = {"root_id", "version", "authority", "approval", "grants",
+                "policies", "authority_signature", "root_hash"}
+    if type(state) is not dict or set(state) != expected:
+        raise ValueError("ARTIFACT_TRUST_ROOT_INVALID")
+    return state
+
+
+def _authenticated_trust_root_classification(trust_root: Any) -> bool:
+    """Validate signed root state and derive its closed trust classification.
+
+    Trust decisions call this function directly.  In particular, they never read
+    ``ArtifactTrustRoot.synthetic_only`` or invoke a replaceable class validator,
+    so monkeypatching a class descriptor cannot relabel synthetic authorization.
+    """
+    state = _trust_root_state(trust_root)
+    root_id = state["root_id"]
+    if root_id == "INVERTER-ARTIFACT-TRUST-ROOT":
+        expected_synthetic = False
+    elif root_id == "INVERTER-SYNTHETIC-FIXTURE-TRUST-ROOT":
+        expected_synthetic = True
+    else:
+        raise ValueError("ARTIFACT_TRUST_ROOT_CLASSIFICATION_INVALID")
+
+    expected_policies = tuple(sorted((kind, owner, approval)
+                                     for kind, (owner, approval)
+                                     in _TRUST_POLICIES.items()))
+    manifest = _FIXED_TRUST_ROOTS.get(root_id)
+    payload = {"root_id": root_id, "version": state["version"],
+               "authority": state["authority"], "approval": state["approval"],
+               "grants": list(state["grants"]),
+               "policies": list(state["policies"])}
+    try:
+        signature = int(state["authority_signature"], 16)
+    except (TypeError, ValueError):
+        signature = -1
+    signature_valid = (0 < signature < _TRUST_ROOT_RSA_N
+        and pow(signature, _TRUST_ROOT_RSA_E, _TRUST_ROOT_RSA_N)
+            == int(content_hash(payload), 16))
+    exact_manifest = (isinstance(manifest, _FixedTrustRootManifest)
+        and state["version"] == manifest.version
+        and state["grants"] == manifest.grants
+        and state["authority_signature"] == manifest.signature
+        and state["root_hash"] == manifest.root_hash)
+    if (not exact_manifest
+            or state["authority"] != "RepositoryTrustAdministrator"
+            or state["approval"] != "TRUST_ROOT_APPROVED"
+            or state["policies"] != expected_policies
+            or tuple(sorted(set(state["grants"]))) != state["grants"]
+            or state["root_hash"] != content_hash({**payload,
+                "authority_signature":state["authority_signature"]})
+            or not signature_valid):
+        raise ValueError("ARTIFACT_TRUST_ROOT_INVALID")
+    return expected_synthetic
+
+
+def _trust_root_authorizes(trust_root: Any,
+                           artifact: RegisteredArtifact) -> bool:
+    try:
+        _authenticated_trust_root_classification(trust_root)
+        artifact.validate_identity()
+    except (TypeError, ValueError):
+        return False
+    state = _trust_root_state(trust_root)
+    policy = _TRUST_POLICIES.get(artifact.artifact_type)
+    identity = (artifact.artifact_id, artifact.version,
+                artifact.artifact_type, artifact.artifact_hash)
+    return (policy == (artifact.owner, artifact.approval)
+            and identity in state["grants"])
 
 
 def _fixed_trust_root(root_id: str) -> ArtifactTrustRoot:
@@ -2984,7 +3009,7 @@ def _fixed_trust_root(root_id: str) -> ArtifactTrustRoot:
         "RepositoryTrustAdministrator", "TRUST_ROOT_APPROVED",
         manifest.grants, policies, manifest.signature,
         manifest.root_hash)
-    root.validate()
+    _authenticated_trust_root_classification(root)
     return root
 
 
@@ -3001,7 +3026,7 @@ def _require_exact_trust_root(trust_root: Any) -> ArtifactTrustRoot:
     """Reject subclasses and duck types before any trust decision is attempted."""
     if type(trust_root) is not ArtifactTrustRoot:
         raise ValueError("ARTIFACT_TRUST_ROOT_EXACT_TYPE_REQUIRED")
-    trust_root.validate()
+    _authenticated_trust_root_classification(trust_root)
     return trust_root
 
 
@@ -3069,7 +3094,7 @@ class ArtifactRegistry:
         record = self.artifacts.get(ref["artifact_id"])
         if not isinstance(record, RegisteredArtifact):
             raise ValueError("ARTIFACT_CONTENT_NOT_REGISTERED")
-        if not trust_root.authorizes(record):
+        if not _trust_root_authorizes(trust_root, record):
             raise ValueError("ARTIFACT_TRUST_POLICY_REJECTED")
         if (record.version != ref["version"] or record.artifact_hash != ref["hash"]
                 or (artifact_type is not None
@@ -3091,7 +3116,7 @@ class ArtifactRegistry:
             raise ValueError("DEPENDENCY_DAG_RESULT_NODE_SET_MISMATCH")
         for artifact in self.artifacts.values():
             if isinstance(artifact, RegisteredArtifact):
-                if not trust_root.authorizes(artifact):
+                if not _trust_root_authorizes(trust_root, artifact):
                     raise ValueError("ARTIFACT_TRUST_POLICY_REJECTED")
             elif _artifact_digest(artifact) is None:
                 raise ValueError("ARTIFACT_CONTENT_HASH_INVALID")
@@ -3112,7 +3137,7 @@ class ArtifactRegistry:
                           else self.results[dep].computation_artifact_hash)
                 if actual is None or hashes.get(dep) != actual:
                     raise ValueError("DEPENDENCY_DAG_HASH_MISMATCH")
-            synthetic_dependency = (trust_root.synthetic_only or any(
+            synthetic_dependency = (_authenticated_trust_root_classification(trust_root) or any(
                 dep in result_ids and self.results[dep].synthetic_provenance
                 for dep in declared))
             if synthetic_dependency and not result.synthetic_provenance:
@@ -3160,7 +3185,8 @@ class ArtifactRegistry:
                     else:
                         artifact = self.artifacts.get(dep)
                         if (isinstance(artifact, RegisteredArtifact)
-                                and not self.trust_root.authorizes(artifact)):
+                                and not _trust_root_authorizes(
+                                    self.trust_root, artifact)):
                             return False
                         if _artifact_digest(artifact) != dict(result.dependency_hashes).get(dep):
                             return False
@@ -3332,7 +3358,7 @@ def _unavailable_settlement(reason: str, diagnostics: Sequence[str],
         {"decision_type":"SETTLEMENT_DECISION","state":"TRANSITION",
          "passed":False,"reason":reason}, Availability.UNAVAILABLE,
         diagnostics=diagnostics, non_gating=True,
-        synthetic_provenance=root.synthetic_only,
+        synthetic_provenance=_authenticated_trust_root_classification(root),
         suffix="settlement-unavailable"))
     try:
         registered = base.with_result(result_id, result)
@@ -3391,8 +3417,8 @@ def classify_settling(*, caller_settled: Optional[bool], ats: Optional[ATSv2],
             dependency_records={ats_artifact.artifact_id:ats_artifact.artifact_hash,
                 threshold_artifact.artifact_id:threshold_artifact.artifact_hash,
                 observation_artifact.artifact_id:observation_artifact.artifact_hash},
-            non_gating=trust_root.synthetic_only,
-            synthetic_provenance=trust_root.synthetic_only,
+            non_gating=_authenticated_trust_root_classification(trust_root),
+            synthetic_provenance=_authenticated_trust_root_classification(trust_root),
             suffix="classify-settling"))
         registered=registry.with_result(result_id,decision)
         return SettlementClassification(state,decision,registered,result_id)
@@ -3447,7 +3473,7 @@ def no_load_report(settlement_result_id: str, p: int, polarity: int,
                 "canonical_value":value}
         deps=(settlement_decision,residual) if category=="UNINTENDED_DIFFERENTIAL_RESIDUAL" else (settlement_decision,)
         rows.append(material_result(record,availability,dependencies=deps,
-            non_gating=trust_root.synthetic_only or availability is Availability.UNAVAILABLE,
+            non_gating=_authenticated_trust_root_classification(trust_root) or availability is Availability.UNAVAILABLE,
             synthetic_provenance=(settlement_decision.synthetic_provenance
                                   or residual.synthetic_provenance),
             suffix="no-load:"+category))

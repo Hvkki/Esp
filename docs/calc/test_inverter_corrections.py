@@ -632,7 +632,8 @@ class IndependentReviewRegressionTests(unittest.TestCase):
                 "version":manifest.version,"grants":manifest.grants,
                 "signature":manifest.signature,"root_hash":manifest.root_hash,
                 "synthetic_only":False}}
-            self.assertTrue(root.synthetic_only)
+            with self.assertRaisesRegex(ValueError,"ARTIFACT_TRUST_ROOT_INVALID"):
+                _=root.synthetic_only
             with self.assertRaisesRegex(ValueError,"ARTIFACT_TRUST_ROOT_INVALID"):
                 root.validate()
             with self.assertRaisesRegex(ValueError,"ARTIFACT_TRUST_ROOT_INVALID"):
@@ -643,18 +644,35 @@ class IndependentReviewRegressionTests(unittest.TestCase):
         # root_id carries classification in the signed payload. Changing it can
         # produce a non-synthetic-looking object, but never a trusted one.
         relabeled=replace(root,root_id="INVERTER-ARTIFACT-TRUST-ROOT")
-        self.assertFalse(relabeled.synthetic_only)
+        with self.assertRaisesRegex(ValueError,"ARTIFACT_TRUST_ROOT_INVALID"):
+            _=relabeled.synthetic_only
         with self.assertRaisesRegex(ValueError,"ARTIFACT_TRUST_ROOT_INVALID"):
             relabeled.validate()
 
-        registry=valid_registry()
-        authorizations,diagnostics=validate_comparison_registry(registry)
-        self.assertFalse(diagnostics)
-        self.assertTrue(all(a.synthetic_only for a in authorizations))
-        claim=realistic_comparison_result(1,[material_result(1)],True,True,
-                                           authorizations,real_claim=True)
-        self.assertEqual(claim.availability,Availability.UNAVAILABLE)
-        self.assertTrue(claim.non_gating)
+        # Even replacing the class descriptor cannot alter any authenticated
+        # classification consumer. The descriptor visibly lies, while root
+        # validation, registry propagation, and real-claim gating remain safe.
+        original_descriptor=ArtifactTrustRoot.synthetic_only
+        try:
+            ArtifactTrustRoot.synthetic_only=property(lambda self: False)
+            self.assertFalse(root.synthetic_only)
+            root.validate()
+            self.assertTrue(
+                corrections._authenticated_trust_root_classification(root))
+            with self.assertRaisesRegex(ValueError,"SYNTHETIC_PROVENANCE_INVALID"):
+                ArtifactRegistry({}, {"unmarked":()},
+                    {"unmarked":material_result(1)}, root)
+
+            registry=valid_registry()
+            authorizations,diagnostics=validate_comparison_registry(registry)
+            self.assertFalse(diagnostics)
+            self.assertTrue(all(a.synthetic_only for a in authorizations))
+            claim=realistic_comparison_result(1,[material_result(1)],True,True,
+                                               authorizations,real_claim=True)
+            self.assertEqual(claim.availability,Availability.UNAVAILABLE)
+            self.assertTrue(claim.non_gating)
+        finally:
+            ArtifactTrustRoot.synthetic_only=original_descriptor
 
     def test_synthetic_provenance_is_immutable_transitive_and_not_launderable(self):
         synthetic=material_result(1,synthetic_provenance=True)
