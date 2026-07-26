@@ -6,7 +6,7 @@ adapter and the current corrected implementation, then canonically compared.
 NO_BASELINE_BEHAVIOR routes use field-specific behavioral assertions.
 """
 from __future__ import annotations
-import hashlib, json, subprocess, sys
+import ast, hashlib, json, subprocess, sys
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Mapping
@@ -31,17 +31,52 @@ def _input(case_id: str,**values: Any)->dict[str,Any]:
     return {"case_id":case_id,**values}
 
 def baseline_population(key: str)->list[dict[str,Any]]:
+    if key=="TOP_LEVEL:3.2":
+        # Multiple physical designs and battery points exercise the invariant that
+        # current follows frozen turns, never instantaneous battery voltage.
+        return [_input(f"{key}:fixed-ratio:{index}",primary_turns=np,
+                       secondary_turns=ns,output_current=str(current),
+                       battery_voltage=str(voltage))
+                for index,(np,ns,current,voltage) in enumerate((
+                    (1,18,Fraction(3000,230),Fraction(20)),
+                    (1,18,Fraction(3000,230),Fraction(126,5)),
+                    (2,16,Fraction(125,12),Fraction(40)),
+                    (2,16,Fraction(125,12),Fraction(273,5)),
+                    (3,17,Fraction(37,4),Fraction(96,5))),start=1)]
     if key=="TOP_LEVEL:3.3":
         return [_input(f"{key}:equation:{i}",irms=i,rds=str(r),parallel=m)
                 for i,r,m in ((1,Fraction(3,5),1),(10,Fraction(1,2),2),(17,Fraction(7,10),4))]
     return [_input(key+":eligible")]
+
+def _execute_frozen_primary_current(blob: bytes, case: Mapping[str,Any])->Fraction:
+    """Execute the immutable baseline assignment captured from the frozen commit."""
+    tree=ast.parse(blob.decode("utf-8"))
+    expression=None
+    for node in ast.walk(tree):
+        if isinstance(node,(ast.Assign,ast.AnnAssign)):
+            targets=node.targets if isinstance(node,ast.Assign) else [node.target]
+            if any(isinstance(target,ast.Name) and target.id=="I_pri_rms" for target in targets):
+                expression=node.value
+                break
+    assert expression is not None
+    allowed=(ast.Expression,ast.BinOp,ast.Mult,ast.Name,ast.Load)
+    assert all(isinstance(node,allowed) for node in ast.walk(ast.Expression(expression)))
+    environment={"n_real":Fraction(case["secondary_turns"],case["primary_turns"]),
+                 "Io_rms":Fraction(case["output_current"])}
+    return Fraction(eval(compile(ast.Expression(expression),"<frozen-primary-current>","eval"),
+                         {"__builtins__":{}},environment))
+
 
 def immutable_baseline_adapter(key: str,case: Mapping[str,Any],blob: bytes)->Any:
     """Canonical baseline behavior reconstructed only from frozen commit content."""
     if key=="TOP_LEVEL:3.1":
         return {"represented_domains":("LV","HV","TRANSFORMER"),"eligible":all(x in blob for x in (b"LV ",b"HV ","Трансформатор".encode()))}
     if key=="TOP_LEVEL:3.2":
-        return {"relation":"I_pri=n*Iout_rms","fixed_ratio":b"I_pri = n * Iout_rms" in blob}
+        value=_execute_frozen_primary_current(blob,case)
+        return {"primary_current":CanonicalNumber.rational(value,"CURRENT","A"),
+                "turns":(case["primary_turns"],case["secondary_turns"]),
+                "battery_voltage":CanonicalNumber.rational(case["battery_voltage"],"VOLTAGE","V"),
+                "contract":"FIXED_PHYSICAL_TURNS"}
     if key=="TOP_LEVEL:3.3":
         value=Fraction(case["irms"])**2*2*Fraction(case["rds"])/case["parallel"]
         return {"channel_loss":str(value),"equation":"Irms^2*2*Rds/m"}
@@ -60,7 +95,13 @@ def current_corrected_adapter(key: str,case: Mapping[str,Any])->Any:
     if key=="TOP_LEVEL:3.1":
         categories=solve_inverter(_inv(10,Fraction(3,5),2)).canonical_value
         return {"represented_domains":("LV","HV","TRANSFORMER"),"eligible":set(categories)=={"CHANNEL_CONDUCTION","GATE_DRIVE","EOSS_COSS","REVERSE_RECOVERY","SWITCHING_OVERLAP","INTERCONNECT","MAGNETICS","AUXILIARIES","OTHER_DECLARED"}}
-    if key=="TOP_LEVEL:3.2":return {"relation":"I_pri=n*Iout_rms","fixed_ratio":Fraction(18,2)*Fraction(3000,230)==Fraction(18,2)*Fraction(3000,230)}
+    if key=="TOP_LEVEL:3.2":
+        value=fixed_ratio_primary_current(case["primary_turns"],case["secondary_turns"],
+            case["output_current"],battery_voltage=case["battery_voltage"])
+        return {"primary_current":value,
+                "turns":(case["primary_turns"],case["secondary_turns"]),
+                "battery_voltage":CanonicalNumber.rational(case["battery_voltage"],"VOLTAGE","V"),
+                "contract":"FIXED_PHYSICAL_TURNS"}
     if key=="TOP_LEVEL:3.3":
         result=solve_inverter(_inv(case["irms"],Fraction(case["rds"]),case["parallel"]))
         return {"channel_loss":result.canonical_value["CHANNEL_CONDUCTION"],"equation":"Irms^2*2*Rds/m"}

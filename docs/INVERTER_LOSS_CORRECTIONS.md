@@ -35,3 +35,30 @@ The executable contracts now close the six bypasses found by final review:
 - `ArtifactRegistry` validates an exact, closed, acyclic dependency graph against each result’s declared dependency IDs and hashes. Missing, extra, unknown, self, cyclic, or hash-inconsistent edges are rejected before selection or consumption.
 
 Adversarial regression tests reproduce each final-review probe. Frozen Property 1 and frozen Property 2 source artifacts remain byte-for-byte unchanged. Enforced preservation evaluates 69 eligible cases, including three independent bridge-conduction cases, and aggregate acceptance remains non-vacuous while preserving every intentionally non-gating external evidence gap.
+
+
+## Independent re-review corrections
+
+Four confirmed bypasses are now closed. Immutable content hashes are treated only as identity: a separately signed, closed, type-specific trust root must grant the exact artifact ID/version/type/hash and enforce the required owner and approval before comparison, thermal, qualification, control, or publication code can resolve it. Caller-minted artifacts, owner text, rejected approvals, unsigned roots, and ungranted hashes cannot create available decisions.
+
+Preservation key `TOP_LEVEL:3.2` now executes five nontrivial cases through the frozen commit's parsed `I_pri_rms` assignment and the corrected `fixed_ratio_primary_current` production API. The cases cover three turn ratios and multiple battery voltages; canonical primary current remains fixed for each physical ratio. The baseline and current paths no longer use the same local expression.
+
+A settled no-load report now requires a fresh registry result emitted by `classify_settling`. That result has a producer provenance seal and exact dependencies on trusted ATS-v2, product-threshold, and observation artifacts. Copying its threshold ID/hash or constructing an equivalent `MaterialResult` does not establish `SETTLED`.
+
+Finally, `ArtifactRegistry.validate_current` recursively checks every result dependency for freshness, current hashes, trust, and consumability. A fresh descendant of a stale or unavailable intermediate result is rejected. Adversarial regressions exercise these rules across comparison, thermal, qualification, control, publication, settling/no-load, and transitive result consumption.
+
+
+## Closed trust-root hardening
+
+The repository no longer contains a private signing exponent or any API that accepts caller artifacts and returns a newly signed or newly granted trust root. Trust verification now recognizes only two exact externally pre-signed manifests: an empty production root and one closed `SYNTHETIC_TEST_ONLY` fixture manifest whose immutable grant tuples are fixed by artifact ID, version, type, and content hash. Public-key material and fixed signatures can verify those manifests but cannot authorize a new artifact identity or a modified grant.
+
+The synthetic fixture root preserves positive comparison, thermal, settlement, qualification, control, and publication contract tests without creating real evidence. Results produced from that root are non-gating; synthetic qualification and publication are rejected when requested as real claims, and synthetic comparison authorization cannot support a real comparison claim. Adversarial tests copy required owner/approval strings, calculate valid artifact hashes, inspect every repository constant, alter a preauthorized artifact, and recompute the root content hash; all attempts remain unauthorized because the fixed external signature and exact closed manifest no longer match.
+
+
+## Exact-root and transitive synthetic-provenance closure
+
+The final two adversarial findings are closed. Every registry entry point and every comparison, thermal, qualification, control, publication, and settlement decision now requires the exact `ArtifactRegistry` and exact `ArtifactTrustRoot` concrete types. The fixed manifest, signature, policies, grants, and closed dependency DAG are revalidated at each trust boundary. A subclass or duck-typed root that overrides validation or always returns authorization is rejected before it can resolve evidence or produce a decision.
+
+`MaterialResult` and `GateAuthorization` now carry immutable `synthetic_provenance`. `material_result`, `derive_result`, recomputation, comparison authorization, thermal, settlement, qualification, controls, no-load reporting, and publication preserve it transitively and force every synthetic result to remain non-gating. Registry validation checks ancestry, so a non-synthetic wrapper around a synthetic result is invalid even when direct hashes and freshness appear current. Real comparison, qualification, and publication claims reject synthetic provenance rather than relying only on a caller marker.
+
+Direct regressions inject an adversarial always-authorize trust-root subclass into all six decision families and attempt synthetic laundering through a wrapper result. The 52-test unit/property/integration suite, frozen exploration, enforced preservation (73/73 evaluated), all 16 acceptance gates, and complete firmware path/hash equality pass. No firmware source, configuration, or behavior changed.

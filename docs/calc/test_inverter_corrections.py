@@ -6,7 +6,6 @@ All property generators are deterministic and bounded; no watcher or network is 
 from __future__ import annotations
 
 import copy
-import hashlib
 import math
 import sys
 import unittest
@@ -20,7 +19,6 @@ if str(CALC) not in sys.path: sys.path.insert(0,str(CALC))
 
 from inverter_corrections import *
 
-
 def temperatures(): return {n:25.0 for n in THERMAL_NODES}
 def domains(): return {n:(-40.0,175.0) for n in THERMAL_NODES}
 def tref():
@@ -30,20 +28,30 @@ def valid_artifacts(controlled=None,endpoint=None):
     controlled = controlled or controlled_threefold(10.0,True,Fraction(3,5),2)
     endpoint = endpoint or endpoint_sensitivity([{"candidate_id":"c1","current":1.0,"conduction_nonempty":True}],CanonicalNumber.rational(1,"RESISTANCE","mOhm"),CanonicalNumber.rational(2,"RESISTANCE","mOhm"),endpoint_evidence=True,policy=normative_ats(),fixed_inputs=True,closed_immutable_set=True)
     return [frozen_gate_artifact("GATE-CONTROLLED-001",GateIdentity.CONTROLLED_THREEFOLD,controlled,frozen_at=2),frozen_gate_artifact("GATE-ENDPOINT-001",GateIdentity.ENDPOINT_SENSITIVITY,endpoint,frozen_at=3)]
+def comparison_registry(t_ref, artifacts, *, realistic_execution_at=10):
+    root=synthetic_fixture_trust_root()
+    return build_comparison_registry(t_ref,artifacts,
+        realistic_execution_at=realistic_execution_at,
+        prerequisite_trust_root=root)
 def valid_registry(controlled=None,endpoint=None):
-    return build_comparison_registry(tref(),valid_artifacts(controlled,endpoint))
+    return comparison_registry(tref(),valid_artifacts(controlled,endpoint))
 def thermal_artifact(dynamic=True):
     if dynamic:
         content={"temperatures":temperatures(),"domains":domains(),"cth":{"junction":1,"case":2,"heatsink":3},"rth":{"junction":1,"case":1,"heatsink":1},"elapsed":1,"hot_start":True,"boundary_temperatures":{"ambient":25},"cooling_mode":"FORCED_AIR","applied_power":{"junction":3,"case":3,"heatsink":3},"integration_method":"EXPLICIT_EULER","step_control":{"step":1},"convergence_control":{"iterations":10},"error_control":{"absolute":0.01}}
-        artifact=RegisteredArtifact.create("THERMAL-DYNAMIC-001","1","THERMAL_DYNAMIC_INPUT",content)
-        return artifact,artifact_registry([artifact])
+        artifact=RegisteredArtifact.create("THERMAL-DYNAMIC-001","1","THERMAL_DYNAMIC_INPUT",content,owner="InverterOwner",approval="APPROVED")
+        return artifact,artifact_registry([artifact],trust_root=synthetic_fixture_trust_root())
     body={"artifact_id":"THERMAL-STEADY-001","version":"1","owner":"InverterOwner","approval":"APPROVED","rth_network":{"junction":1},"boundary_temperatures":{"ambient":25},"cooling_mode":"FORCED_AIR","loss_model":"CONSTANT_TEST_POWER","supported_domains":{"junction":(-40,175)},"solver_method":"CLOSED_FORM","convergence_control":{"absolute":0.01},"error_control":{"absolute":0.01}}
     return {**body,"artifact_hash":content_hash(body)}
 
 def publication_fixture():
+    policy={"ATS":("InverterOwner","SPEC_NORMATIVE_APPROVAL"),
+            "EVIDENCE_CONFLICT":("EvidenceAdjudicationOwner","APPROVED"),
+            "DIGITAL_ORACLE":("InverterOwner","APPROVED"),
+            "ANALOG_STATUS":("IndependentModelReviewer","APPROVED")}
     refs=[]
     for artifact_type,name in (("ATS","ATS-REF"),("EVIDENCE_CONFLICT","EVIDENCE-REF"),("DIGITAL_ORACLE","ORACLE-REF"),("ANALOG_STATUS","ANALOG-REF")):
-        refs.append(RegisteredArtifact.create(name,"1",artifact_type,{"status":"VALIDATED"}))
+        owner,approval=policy[artifact_type]
+        refs.append(RegisteredArtifact.create(name,"1",artifact_type,{"status":"VALIDATED"},owner=owner,approval=approval))
     return refs
 def residual_record(source_type="LEG_COMMAND_TICK_ASYMMETRY",owner="owner-1"):
     val=PhysicalField.value_of("waveform-1")
@@ -194,27 +202,44 @@ class ResidualSettlingTests(unittest.TestCase):
 
     def test_settling_absent_exceeded_pass(self):
         period=Fraction(2285,160_000_000); ats=normative_ats()
-        state,result=classify_settling(caller_settled=None,ats=ats,thresholds=None,period=period,observations=None)
+        classification=classify_settling(caller_settled=None,ats=ats,thresholds=None,period=period,observations=None)
+        state,result=classification
         self.assertEqual(state,"TRANSITION"); self.assertEqual(result.availability,Availability.UNAVAILABLE); self.assertTrue(result.non_gating)
         thresholds=make_test_thresholds(period)
         base={"window_seconds":thresholds.W_seconds,"ires_rms":0,"vs_per_period":[0],"vs_cumulative":0,"end_energy":0,"energy_sources":thresholds.closed_energy_sources}
-        self.assertEqual(classify_settling(caller_settled=None,ats=ats,thresholds=thresholds,period=period,observations=base)[0],"SETTLED")
+        ats_artifact=registered_ats(ats); threshold_artifact=registered_thresholds(thresholds)
+        observation_artifact=registered_settling_observations("SETTLING-OBS-PASS",base)
+        artifacts=[ats_artifact,threshold_artifact,observation_artifact]
+        registry=artifact_registry(artifacts,trust_root=synthetic_fixture_trust_root())
+        passed=classify_settling(caller_settled=None,ats=ats,thresholds=thresholds,period=period,observations=base,
+            registry=registry,ats_ref=ats_artifact.ref,thresholds_ref=threshold_artifact.ref,observations_ref=observation_artifact.ref)
+        self.assertEqual(passed.state,"SETTLED"); self.assertTrue(passed.registry.validate_current(passed.result_id)); self.assertTrue(passed.decision.non_gating); self.assertTrue(passed.decision.synthetic_provenance)
         failed={**base,"ires_rms":1}
-        state,result=classify_settling(caller_settled=None,ats=ats,thresholds=thresholds,period=period,observations=failed)
-        self.assertEqual(state,"TRANSITION"); self.assertEqual(result.availability,Availability.AVAILABLE)
+        failed_observation=registered_settling_observations("SETTLING-OBS-FAIL",failed)
+        failed_artifacts=[ats_artifact,threshold_artifact,failed_observation]
+        failed_registry=artifact_registry(failed_artifacts,trust_root=synthetic_fixture_trust_root())
+        classification=classify_settling(caller_settled=None,ats=ats,thresholds=thresholds,period=period,observations=failed,
+            registry=failed_registry,ats_ref=ats_artifact.ref,thresholds_ref=threshold_artifact.ref,observations_ref=failed_observation.ref)
+        self.assertEqual(classification.state,"TRANSITION"); self.assertEqual(classification.decision.availability,Availability.AVAILABLE)
 
     def test_all_no_load_categories_and_loaded_constants(self):
         residual=aggregate_residuals(("HF_LINK_PSFB","ZERO_SETTLED","DISABLED","DISABLED"),[residual_record()])
-        period=Fraction(2285,160_000_000)
-        _,decision=classify_settling(caller_settled=None,ats=normative_ats(),thresholds=None,period=period,observations=None)
-        report=no_load_report(decision,0,1,residual,None)
+        period=Fraction(2285,160_000_000); ats=normative_ats(); thresholds=make_test_thresholds(period)
+        observations={"window_seconds":thresholds.W_seconds,"ires_rms":0,"vs_per_period":[0],"vs_cumulative":0,"end_energy":0,"energy_sources":thresholds.closed_energy_sources}
+        artifacts=[registered_ats(ats),registered_thresholds(thresholds),registered_settling_observations("SETTLING-OBS-NOLOAD",observations)]
+        registry=artifact_registry(artifacts,trust_root=synthetic_fixture_trust_root())
+        classification=classify_settling(caller_settled=None,ats=ats,thresholds=thresholds,period=period,observations=observations,
+            registry=registry,ats_ref=artifacts[0].ref,thresholds_ref=artifacts[1].ref,observations_ref=artifacts[2].ref)
+        report=no_load_report(classification.result_id,0,1,residual,registry=classification.registry)
         self.assertEqual({r.canonical_value["category"] for r in report},set(NO_LOAD_CATEGORIES)); self.assertEqual(len(report),8)
         self.assertTrue(all(isinstance(r,MaterialResult) for r in report))
-        nonzero=no_load_report(decision,10,1,residual,None)
+        self.assertTrue(all(r.synthetic_provenance and r.non_gating for r in report))
+        nonzero=no_load_report(classification.result_id,10,1,residual,registry=classification.registry)
         ideal=next(r for r in nonzero if r.canonical_value["category"]=="INTENTIONAL_IDEAL_DIFFERENTIAL_TRANSFER")
         self.assertEqual(ideal.availability,Availability.UNAVAILABLE)
-        fake=material_result({"decision_type":"SETTLEMENT_DECISION","state":"SETTLED","passed":True})
-        with self.assertRaises(ValueError): no_load_report(fake,0,1,residual,None)
+        fake=material_result(copy.deepcopy(classification.decision.canonical_value),dependency_records=dict(classification.decision.dependency_hashes),synthetic_provenance=True)
+        forged_registry=registry.with_result("forged-settlement",fake)
+        with self.assertRaises(ValueError): no_load_report("forged-settlement",0,1,residual,registry=forged_registry)
         for x in (36.0,42.8): self.assertEqual(reject_loaded_constant_no_load(x,"LOADED","NO_LOAD").availability,Availability.UNAVAILABLE)
 
     def test_properties_9_10_11_19(self):
@@ -253,7 +278,7 @@ class BoundaryThermalTests(unittest.TestCase):
         missing=dict(temperatures()); missing.pop("coolant"); self.assertEqual(cold_snapshot(missing,domains()).availability,Availability.UNAVAILABLE)
         method,registry=thermal_artifact(True)
         transient=thermal_transient(temperatures(),domains(),{"junction":1,"case":2,"heatsink":3},{"junction":1,"case":1,"heatsink":1},1,method.ref,hot_start=True,registry=registry)
-        self.assertEqual(transient.canonical_value["mode"],"HOT_START_TRANSIENT")
+        self.assertEqual(transient.canonical_value["mode"],"HOT_START_TRANSIENT"); self.assertTrue(transient.non_gating); self.assertTrue(transient.synthetic_provenance)
         # Caller-supplied physical values may not disagree with the registered artifact.
         self.assertEqual(thermal_transient(temperatures(),domains(),{"junction":999,"case":999,"heatsink":999},{"junction":999,"case":999,"heatsink":999},1,method.ref,hot_start=True,registry=registry).availability,Availability.UNAVAILABLE)
         self.assertEqual(thermal_transient(temperatures(),domains(),{"junction":1,"case":2,"heatsink":3},{"junction":1,"case":1,"heatsink":1},1,method.ref,hot_start=True).availability,Availability.UNAVAILABLE)
@@ -300,11 +325,12 @@ class ComparisonTests(unittest.TestCase):
     def test_registry_valid_ineligibility_authorizes_without_claims(self):
         controlled=controlled_threefold(0,True,Fraction(3,5),2)
         endpoint=endpoint_sensitivity([{"candidate_id":"a","current":0.0,"conduction_nonempty":False}],CanonicalNumber.rational(1,"RESISTANCE","mOhm"),CanonicalNumber.rational(2,"RESISTANCE","mOhm"),endpoint_evidence=True,policy=normative_ats(),fixed_inputs=True,closed_immutable_set=True)
-        artifacts=valid_artifacts(controlled,endpoint); registry=build_comparison_registry(tref(),artifacts); auth,diag=validate_comparison_registry(registry)
-        self.assertFalse(diag); self.assertTrue(all(a.authorizes("PROGRESS_TO_REALISTIC_COMPARISON") for a in auth)); self.assertTrue(all(a.permitted_ineligibility for a in auth))
+        artifacts=valid_artifacts(controlled,endpoint); registry=comparison_registry(tref(),artifacts); auth,diag=validate_comparison_registry(registry)
+        self.assertFalse(diag); self.assertTrue(all(a.authorizes("PROGRESS_TO_REALISTIC_COMPARISON") for a in auth)); self.assertTrue(all(a.permitted_ineligibility for a in auth)); self.assertTrue(all(a.synthetic_only for a in auth))
         original=copy.deepcopy(artifacts)
         outputs=[realistic_comparison_result(1,[material_result(1)],e,c,auth).availability for e,c in ((True,True),(False,True),(True,False))]
         self.assertEqual(outputs,[Availability.AVAILABLE,Availability.PROVISIONAL,Availability.UNAVAILABLE]); self.assertEqual(artifacts,original)
+        self.assertEqual(realistic_comparison_result(1,[material_result(1)],True,True,auth,real_claim=True).availability,Availability.UNAVAILABLE)
 
     def test_registry_rejects_every_structural_bypass(self):
         base=valid_artifacts()
@@ -314,7 +340,11 @@ class ComparisonTests(unittest.TestCase):
         multi=copy.deepcopy(base); multi[0]["outcomes"].append(copy.deepcopy(multi[0]["outcomes"][0])); multi[0]["artifact_hash"]=content_hash({k:v for k,v in multi[0].items() if k!="artifact_hash"}); mutations.append(multi)
         badcode=valid_artifacts(controlled_threefold(0,True,Fraction(3,5),2)); badcode[0]["outcomes"][0]["canonical_code"]="INELIGIBLE"; badcode[0]["artifact_hash"]=content_hash({k:v for k,v in badcode[0].items() if k!="artifact_hash"}); mutations.append(badcode)
         for artifacts in mutations:
-            auth,diag=validate_comparison_registry(build_comparison_registry(tref(),artifacts)); self.assertTrue(diag); self.assertTrue(all(not a.valid for a in auth))
+            try:
+                registry=comparison_registry(tref(),artifacts)
+            except ValueError:
+                continue
+            auth,diag=validate_comparison_registry(registry); self.assertTrue(diag); self.assertTrue(all(not a.valid for a in auth))
             dependent=realistic_comparison_result(1,[material_result(1)],True,True,auth); self.assertEqual(dependent.availability,Availability.UNAVAILABLE)
 
     def test_comparison_prerequisites_resolve_registered_complete_content(self):
@@ -323,21 +353,21 @@ class ComparisonTests(unittest.TestCase):
         artifacts=valid_artifacts(controlled,endpoint)
         # Review probe 1: strip every controlled prerequisite except current/conduction.
         original=controlled["_registered_prerequisite"]
-        stripped=RegisteredArtifact.create("STRIPPED","1","CONTROLLED_PREREQUISITES",{"irms_bits":original.content["irms_bits"],"conduction_nonempty":True})
+        stripped=RegisteredArtifact.create("STRIPPED","1","CONTROLLED_PREREQUISITES",{"irms_bits":original.content["irms_bits"],"conduction_nonempty":True},owner="InverterOwner",approval="APPROVED")
         bad_controlled=copy.deepcopy(controlled); bad_controlled["prerequisite_ref"]=stripped.ref; bad_controlled["_registered_prerequisite"]=stripped
         bad_artifacts=valid_artifacts(bad_controlled,endpoint)
-        auth,diag=validate_comparison_registry(build_comparison_registry(tref(),bad_artifacts))
+        auth,diag=validate_comparison_registry(comparison_registry(tref(),bad_artifacts))
         self.assertIn("CONTROLLED_INELIGIBILITY_PREREQUISITE_INVALID",diag); self.assertTrue(all(not a.valid for a in auth))
         # Review probe 2: endpoint reference points to unrelated registered content.
-        unrelated=RegisteredArtifact.create("UNRELATED","1","CONTROLLED_PREREQUISITES",original.content)
+        unrelated=RegisteredArtifact.create("UNRELATED","1","CONTROLLED_PREREQUISITES",original.content,owner="InverterOwner",approval="APPROVED")
         bad_endpoint=copy.deepcopy(endpoint); bad_endpoint["prerequisite_ref"]=unrelated.ref; bad_endpoint["_registered_prerequisite"]=unrelated
-        auth,diag=validate_comparison_registry(build_comparison_registry(tref(),valid_artifacts(controlled,bad_endpoint)))
+        auth,diag=validate_comparison_registry(comparison_registry(tref(),valid_artifacts(controlled,bad_endpoint)))
         self.assertIn("ENDPOINT_EVIDENCE_OR_POLICY_INVALID",diag); self.assertTrue(all(not a.valid for a in auth))
 
     def test_tref_failures_and_reconciliation(self):
         for mutation in ({"unit":""},{"value":math.inf},{"baseline_domain":[80,100]}):
-            t=tref(); t.update(mutation); t["artifact_hash"]=content_hash({k:v for k,v in t.items() if k!="artifact_hash"}); auth,diag=validate_comparison_registry(build_comparison_registry(t,valid_artifacts())); self.assertIn("COMPARISON_TREF_INVALID_OR_LATE",diag)
-        late=build_comparison_registry(tref(),valid_artifacts(),realistic_execution_at=2); self.assertIn("COMPARISON_TREF_INVALID_OR_LATE",validate_comparison_registry(late)[1])
+            t=tref(); t.update(mutation); t["artifact_hash"]=content_hash({k:v for k,v in t.items() if k!="artifact_hash"}); auth,diag=validate_comparison_registry(comparison_registry(t,valid_artifacts())); self.assertIn("COMPARISON_TREF_INVALID_OR_LATE",diag)
+        late=comparison_registry(tref(),valid_artifacts(),realistic_execution_at=2); self.assertIn("COMPARISON_TREF_INVALID_OR_LATE",validate_comparison_registry(late)[1])
         got=reconcile_comparison({"CHANNEL":Fraction(-2)},{"CHANNEL":Fraction(1)},Fraction(-1),normative_ats()); self.assertTrue(got.canonical_value["reconciled"])
 
     def test_property_15_generated_code_predicate_cross(self):
@@ -347,7 +377,7 @@ class ComparisonTests(unittest.TestCase):
                 outcome=controlled_threefold(current,conducts,Fraction(3,5),2); outcome["canonical_code"]=code
                 artifact=frozen_gate_artifact("C",GateIdentity.CONTROLLED_THREEFOLD,outcome)
                 endpoint=valid_artifacts()[1]
-                registry=build_comparison_registry(tref(),[artifact,endpoint])
+                registry=comparison_registry(tref(),[artifact,endpoint])
                 auth,diag=validate_comparison_registry(registry)
                 self.assertEqual(not diag,code==correct)
 
@@ -360,38 +390,74 @@ class QualificationControlPublicationTests(unittest.TestCase):
         result=qualification_result(incomplete,real_claim=True); self.assertEqual(result.availability,Availability.UNAVAILABLE); self.assertTrue(result.non_gating)
         mixed={"synthetic_marker":True,"nodes":[{"synthetic_marker":False}]}; self.assertIn("SYNTHETIC_REAL_MIX",qualification_result(mixed,real_claim=False).diagnostics)
 
+        limits=[]
+        for name in QUALIFICATION_LIMITS:
+            content={"subject_device":"SYNTHETIC-UNIT-DEVICE","limit_name":name,
+                "value":100.0,"unit":"synthetic-unit","rating_class":"SYNTHETIC_TEST_LIMIT",
+                "applicability":"SYNTHETIC_TEST_ONLY","pass_rule":"<=",
+                "locator":"synthetic fixture","source_conditions":{"synthetic_marker":True}}
+            limits.append(RegisteredArtifact.create("SYNTH-QUAL-LIMIT-"+name.upper(),"1",
+                "QUALIFICATION_LIMIT",content,owner="ManufacturerEvidenceOwner",approval="APPROVED"))
+        stress_content={"subject_device":"SYNTHETIC-UNIT-DEVICE","interval":"synthetic",
+            "sample_rate":1,"bandwidth":1,"instruments_calibration":{"synthetic_marker":True},
+            "uncertainty":0,"alignment":"synthetic","peak_rule":"max","samples":[0],
+            "observations":{name:1.0 for name in QUALIFICATION_LIMITS}}
+        stress=RegisteredArtifact.create("SYNTH-QUAL-STRESS","1","QUALIFICATION_STRESS",
+            stress_content,owner="IndependentTestOwner",approval="APPROVED")
+        registry=artifact_registry([*limits,stress],trust_root=synthetic_fixture_trust_root())
+        graph={"synthetic_marker":True,"nodes":[{"synthetic_marker":True}],
+            "exact_device":"SYNTHETIC-UNIT-DEVICE",
+            "limit_refs":{record.content["limit_name"]:record.ref for record in limits},
+            "stress_ref":stress.ref,"dc_voltage":1,"derating_rule":"SYNTHETIC_TEST_ONLY",
+            "operating_conditions":{"synthetic_marker":True}}
+        qualified=qualification_result(graph,real_claim=False,registry=registry)
+        self.assertEqual(qualified.canonical_value["qualified"],True)
+        self.assertTrue(qualified.non_gating)
+        self.assertTrue(qualified.synthetic_provenance)
+        self.assertEqual(qualification_result(graph,real_claim=True,registry=registry).availability,
+                         Availability.UNAVAILABLE)
+
     def test_control_axes_all_products_independent(self):
-        fw_source=RegisteredArtifact.create("FW-SOURCE","1","FIRMWARE_CONTROL_SOURCE",{"source_paths":["firmware/main/pwm.c"],"config_hash":content_hash("config"),"requirement_code_trace":{"R2.27":"pwm.c"},"build_hash":content_hash("build")})
-        fw_test=RegisteredArtifact.create("FW-TEST","1","FIRMWARE_CONTROL_TEST",{"requirement":"R2.27","deterministic":True,"complete_requirement_exercised":True,"passed":True})
-        hw_test=RegisteredArtifact.create("HW-TEST","1","HARDWARE_CONTROL_TEST",{"exact_hardware_identity":"prototype-001","firmware_config_hash":content_hash("config"),"instruments_calibration":{"scope":"CAL-1"},"conditions":{"dc_voltage":24},"waveform_coverage":{"seconds":1},"limits":{"phase":1},"requirement":"R2.27","passed":True})
-        registry=artifact_registry([fw_source,fw_test,hw_test])
+        fw_source=RegisteredArtifact.create("FW-SOURCE","1","FIRMWARE_CONTROL_SOURCE",{"source_paths":["firmware/main/pwm.c"],"config_hash":content_hash("config"),"requirement_code_trace":{"R2.27":"pwm.c"},"build_hash":content_hash("build")},owner="InverterOwner",approval="APPROVED")
+        fw_test=RegisteredArtifact.create("FW-TEST","1","FIRMWARE_CONTROL_TEST",{"requirement":"R2.27","deterministic":True,"complete_requirement_exercised":True,"passed":True},owner="IndependentSoftwareVerifier",approval="APPROVED")
+        hw_test=RegisteredArtifact.create("HW-TEST","1","HARDWARE_CONTROL_TEST",{"exact_hardware_identity":"prototype-001","firmware_config_hash":content_hash("config"),"instruments_calibration":{"scope":"CAL-1"},"conditions":{"dc_voltage":24},"waveform_coverage":{"seconds":1},"limits":{"phase":1},"requirement":"R2.27","passed":True},owner="IndependentHardwareVerifier",approval="APPROVED")
+        control_artifacts=[fw_source,fw_test,hw_test]
+        registry=artifact_registry(control_artifacts,trust_root=synthetic_fixture_trust_root())
         firmware_ok={"source_config_ref":fw_source.ref,"deterministic_test_ref":fw_test.ref}
         hardware_ok={"test_ref":hw_test.ref}
         for fw,hw in product((None,firmware_ok), (None,hardware_ok)):
             result=control_evidence(fw,hw,registry)
             self.assertEqual(result["firmware_implementation_status"].canonical_value,ControlStatus.UNAVAILABLE.value if fw is None else ControlStatus.VERIFIED.value)
             self.assertEqual(result["hardware_measurement_status"].canonical_value,ControlStatus.UNAVAILABLE.value if hw is None else ControlStatus.VERIFIED.value)
-        empty=RegisteredArtifact.create("FW-EMPTY","1","FIRMWARE_CONTROL_SOURCE",{"source_paths":[],"config_hash":"","requirement_code_trace":{},"build_hash":""})
-        bad_registry=artifact_registry([empty,fw_test])
+            if fw is not None: self.assertTrue(result["firmware_implementation_status"].non_gating); self.assertTrue(result["firmware_implementation_status"].synthetic_provenance)
+            if hw is not None: self.assertTrue(result["hardware_measurement_status"].non_gating); self.assertTrue(result["hardware_measurement_status"].synthetic_provenance)
+        empty=RegisteredArtifact.create("FW-EMPTY","1","FIRMWARE_CONTROL_SOURCE",{"source_paths":[],"config_hash":"","requirement_code_trace":{},"build_hash":""},owner="InverterOwner",approval="APPROVED")
+        bad_artifacts=[empty,fw_test]
+        bad_registry=artifact_registry(bad_artifacts,trust_root=synthetic_fixture_trust_root())
         self.assertEqual(control_axis_status("firmware",{"source_config_ref":empty.ref,"deterministic_test_ref":fw_test.ref},bad_registry).availability,Availability.UNAVAILABLE)
 
     def test_publication_accept_reject(self):
         refs=publication_fixture()
         ref_by_type={r.artifact_type:r for r in refs}
-        firmware_status=material_result(ControlStatus.UNAVAILABLE.value,Availability.UNAVAILABLE,non_gating=True,suffix="publication-fw")
-        hardware_status=material_result(ControlStatus.UNAVAILABLE.value,Availability.UNAVAILABLE,non_gating=True,suffix="publication-hw")
-        context_content={"boundary":"INVERTER","assumption_variant":"TARGET_060","ats_ref":ref_by_type["ATS"].ref,"evidence_conflict_ref":ref_by_type["EVIDENCE_CONFLICT"].ref,"digital_oracle_ref":ref_by_type["DIGITAL_ORACLE"].ref,"analog_status_ref":ref_by_type["ANALOG_STATUS"].ref,"thermal_case":"COLD_T0","firmware_status_result_id":"firmware-status","hardware_status_result_id":"hardware-status","result_basis":"CALCULATED_ESTIMATE","uncertainty_or_bound":{"absolute":"1/100 W"},"synthetic_marker":False}
-        context=RegisteredArtifact.create("PUB-CONTEXT","1","PUBLICATION_CONTEXT",context_content)
+        firmware_status=material_result(ControlStatus.UNVERIFIED.value,Availability.AVAILABLE,synthetic_provenance=True,suffix="publication-fw")
+        hardware_status=material_result(ControlStatus.UNVERIFIED.value,Availability.AVAILABLE,synthetic_provenance=True,suffix="publication-hw")
+        context_content={"boundary":"INVERTER","assumption_variant":"TARGET_060","ats_ref":ref_by_type["ATS"].ref,"evidence_conflict_ref":ref_by_type["EVIDENCE_CONFLICT"].ref,"digital_oracle_ref":ref_by_type["DIGITAL_ORACLE"].ref,"analog_status_ref":ref_by_type["ANALOG_STATUS"].ref,"thermal_case":"COLD_T0","firmware_status_result_id":"firmware-status","hardware_status_result_id":"hardware-status","result_basis":"CALCULATED_ESTIMATE","uncertainty_or_bound":{"absolute":"1/100 W"},"synthetic_marker":True}
+        context=RegisteredArtifact.create("PUB-CONTEXT","1","PUBLICATION_CONTEXT",context_content,owner="PublicationOwner",approval="APPROVED")
         records={r.artifact_id:r.artifact_hash for r in (*refs,context)}
         records.update({"firmware-status":firmware_status.computation_artifact_hash,"hardware-status":hardware_status.computation_artifact_hash})
-        base=material_result(CanonicalNumber.rational(1,"POWER","W"),dependency_records=records)
-        registry=artifact_registry([*refs,context],{"firmware-status":firmware_status,"hardware-status":hardware_status,"result":base})
-        claim={"boundary":"INVERTER","assumption_variant":"TARGET_060","ats":ref_by_type["ATS"].ref,"evidence_conflict":ref_by_type["EVIDENCE_CONFLICT"].ref,"digital_oracle":ref_by_type["DIGITAL_ORACLE"].ref,"analog_status":ref_by_type["ANALOG_STATUS"].ref,"thermal_case":"COLD_T0","firmware_implementation_status":"UNAVAILABLE","hardware_measurement_status":"UNAVAILABLE","result_basis":"CALCULATED_ESTIMATE","availability":base.availability.value,"freshness":base.freshness.value,"trace_identity":base.trace_identity,"dependency_set":base.dependency_record_ids,"uncertainty_or_bound":{"absolute":"1/100 W"},"synthetic_marker":False,"canonical_value":base.canonical_value,"publication_context_ref":context.ref}
-        self.assertNotEqual(publish(claim,base,registry=registry,result_id="result").availability,Availability.UNAVAILABLE)
+        base=material_result(CanonicalNumber.rational(1,"POWER","W"),dependency_records=records,synthetic_provenance=True)
+        publication_artifacts=[*refs,context]
+        registry=artifact_registry(publication_artifacts,{"firmware-status":firmware_status,"hardware-status":hardware_status,"result":base},trust_root=synthetic_fixture_trust_root())
+        claim={"boundary":"INVERTER","assumption_variant":"TARGET_060","ats":ref_by_type["ATS"].ref,"evidence_conflict":ref_by_type["EVIDENCE_CONFLICT"].ref,"digital_oracle":ref_by_type["DIGITAL_ORACLE"].ref,"analog_status":ref_by_type["ANALOG_STATUS"].ref,"thermal_case":"COLD_T0","firmware_implementation_status":"UNVERIFIED","hardware_measurement_status":"UNVERIFIED","result_basis":"CALCULATED_ESTIMATE","availability":base.availability.value,"freshness":base.freshness.value,"trace_identity":base.trace_identity,"dependency_set":base.dependency_record_ids,"uncertainty_or_bound":{"absolute":"1/100 W"},"synthetic_marker":True,"canonical_value":base.canonical_value,"publication_context_ref":context.ref}
+        published=publish(claim,base,registry=registry,result_id="result")
+        self.assertNotEqual(published.availability,Availability.UNAVAILABLE)
+        self.assertTrue(published.non_gating)
+        self.assertTrue(published.synthetic_provenance)
+        self.assertEqual(publish(claim,base,real_claim=True,registry=registry,result_id="result").availability,Availability.UNAVAILABLE)
         for field,value in (("boundary","INVENTED"),("ats",{"artifact_id":"fake","version":"1","hash":content_hash("fake")}),("result_basis","")):
             bad={**claim,field:value}; self.assertEqual(publish(bad,base,registry=registry,result_id="result").availability,Availability.UNAVAILABLE)
         stale=replace(base,freshness=Freshness.STALE)
-        stale_registry=object.__new__(ArtifactRegistry); object.__setattr__(stale_registry,"artifacts",registry.artifacts); object.__setattr__(stale_registry,"dependencies",registry.dependencies); object.__setattr__(stale_registry,"results",{"result":stale})
+        stale_registry=object.__new__(ArtifactRegistry); object.__setattr__(stale_registry,"artifacts",registry.artifacts); object.__setattr__(stale_registry,"dependencies",registry.dependencies); object.__setattr__(stale_registry,"results",{"result":stale}); object.__setattr__(stale_registry,"trust_root",registry.trust_root)
         self.assertEqual(publish(claim,stale,registry=stale_registry,result_id="result").availability,Availability.UNAVAILABLE)
 
     def test_properties_16_17_20(self):
@@ -426,7 +492,7 @@ class FirmwareAndIntegrationTests(unittest.TestCase):
         timing=validate_timing(compute_timing_from_firmware(0),independent_expected_timing(0)); self.assertEqual(timing.availability,Availability.AVAILABLE)
         controlled=controlled_threefold(0,True,Fraction(3,5),2)
         endpoint=endpoint_sensitivity([{"candidate_id":"zero","current":0.0,"conduction_nonempty":False}],CanonicalNumber.rational(1,"RESISTANCE","mOhm"),CanonicalNumber.rational(2,"RESISTANCE","mOhm"),endpoint_evidence=True,policy=normative_ats(),fixed_inputs=True,closed_immutable_set=True)
-        auth,diag=validate_comparison_registry(build_comparison_registry(tref(),valid_artifacts(controlled,endpoint))); self.assertFalse(diag)
+        auth,diag=validate_comparison_registry(comparison_registry(tref(),valid_artifacts(controlled,endpoint))); self.assertFalse(diag)
         realistic=realistic_comparison_result({"delta":"bounded"},[timing],False,True,auth); self.assertEqual(realistic.availability,Availability.PROVISIONAL)
         self.assertFalse(any(controlled[k] for k in FALSE_CLAIM_KEYS)); self.assertFalse(any(endpoint[k] for k in FALSE_CLAIM_KEYS))
 
@@ -440,10 +506,10 @@ class StrengthenedBypassTests(unittest.TestCase):
     def test_minimal_fabricated_completed_outcomes_rejected(self):
         fabricated={"kind":"COMPLETED","requirement":"2.29","valid":True}
         artifacts=valid_artifacts(); artifacts[0]=frozen_gate_artifact("C",GateIdentity.CONTROLLED_THREEFOLD,fabricated)
-        auth,diag=validate_comparison_registry(build_comparison_registry(tref(),artifacts))
+        auth,diag=validate_comparison_registry(comparison_registry(tref(),artifacts))
         self.assertIn("COMPARISON_GATE_COMPLETED_RESULT_INVALID",diag); self.assertTrue(all(not a.valid for a in auth))
         forged=valid_artifacts(); forged[0]["outcomes"][0]["replacement_channel_loss"]="999"; forged[0]["artifact_hash"]=content_hash({k:v for k,v in forged[0].items() if k not in {"artifact_hash","_registered_prerequisite"}})
-        self.assertIn("COMPARISON_GATE_COMPLETED_RESULT_INVALID",validate_comparison_registry(build_comparison_registry(tref(),forged))[1])
+        self.assertIn("COMPARISON_GATE_COMPLETED_RESULT_INVALID",validate_comparison_registry(comparison_registry(tref(),forged))[1])
 
     def test_thermal_fake_uniqueness_and_missing_power_rejected(self):
         self.assertEqual(verify_root_certificate({"root_count":1},{"root_count":1}).canonical_value,"UNPROVEN")
@@ -474,6 +540,227 @@ class StrengthenedBypassTests(unittest.TestCase):
         self.assertEqual(consume_registered(changed,"c").availability,Availability.UNAVAILABLE)
         with self.assertRaises(ValueError): ArtifactRegistry({"e":ehash},{},{"a":a,"b":b,"c":c})
         with self.assertRaises(ValueError): ArtifactRegistry({"e":ehash},{"a":("e",),"b":("a","e"),"c":("b",)},{"a":a,"b":b,"c":c})
+
+
+class IndependentReviewRegressionTests(unittest.TestCase):
+    class AlwaysAuthorizeRoot(ArtifactTrustRoot):
+        @property
+        def synthetic_only(self):
+            return False
+
+        def validate(self):
+            return None
+
+        def authorizes(self, artifact):
+            return True
+
+    def _always_authorize_root(self):
+        legitimate=synthetic_fixture_trust_root()
+        return self.AlwaysAuthorizeRoot(
+            legitimate.root_id,legitimate.version,legitimate.authority,
+            legitimate.approval,legitimate.grants,legitimate.policies,
+            legitimate.authority_signature,legitimate.root_hash)
+
+    def _registry_with_root(self, registry, root):
+        forged=object.__new__(ArtifactRegistry)
+        object.__setattr__(forged,"artifacts",registry.artifacts)
+        object.__setattr__(forged,"results",registry.results)
+        object.__setattr__(forged,"dependencies",registry.dependencies)
+        object.__setattr__(forged,"trust_root",root)
+        return forged
+
+    def _untrusted_registry(self, artifacts, results=None, dependencies=None):
+        registry=object.__new__(ArtifactRegistry)
+        object.__setattr__(registry,"artifacts",{a.artifact_id:a for a in artifacts})
+        object.__setattr__(registry,"results",dict(results or {}))
+        object.__setattr__(registry,"dependencies",dict(dependencies or {}))
+        object.__setattr__(registry,"trust_root",empty_trust_root())
+        return registry
+
+    def test_always_authorize_root_subclass_rejected_by_every_registry_path(self):
+        fake_root=self._always_authorize_root()
+        with self.assertRaisesRegex(ValueError,"EXACT_TYPE"):
+            ArtifactRegistry({}, {}, {}, fake_root)
+        with self.assertRaisesRegex(ValueError,"EXACT_TYPE"):
+            artifact_registry([], trust_root=fake_root)
+
+        empty=self._registry_with_root(artifact_registry([]),fake_root)
+        thermal=thermal_transient(temperatures(),domains(),
+            {"junction":1,"case":1,"heatsink":1},
+            {"junction":1,"case":1,"heatsink":1},1,{},registry=empty)
+        self.assertIn("EXACT_TYPE",str(thermal.canonical_value))
+        qualification=qualification_result({"synthetic_marker":False,"nodes":[]},
+            real_claim=True,registry=empty)
+        self.assertIn("EXACT_TYPE",str(qualification.canonical_value))
+        control=control_axis_status("firmware",{},empty)
+        self.assertIn("EXACT_TYPE",str(control.diagnostics))
+        publication=publish({},material_result(1),registry=empty,result_id="result")
+        self.assertIn("EXACT_TYPE",str(publication.canonical_value))
+        settlement=classify_settling(caller_settled=None,ats=None,thresholds=None,
+            period=Fraction(1),observations=None,registry=empty)
+        self.assertIn("EXACT_TYPE",str(settlement.decision.canonical_value))
+        with self.assertRaisesRegex(ValueError,"EXACT_TYPE"):
+            no_load_report("result",0,1,material_result(0),registry=empty)
+
+        valid=valid_registry()
+        forged_prerequisites=self._registry_with_root(valid.prerequisite_registry,
+                                                       fake_root)
+        forged_comparison=replace(valid,prerequisite_registry=forged_prerequisites)
+        authorizations,diagnostics=validate_comparison_registry(forged_comparison)
+        self.assertIn("COMPARISON_PREREQUISITE_REGISTRY_INVALID",diagnostics)
+        self.assertTrue(all(not authorization.valid for authorization in authorizations))
+
+    def test_synthetic_provenance_is_immutable_transitive_and_not_launderable(self):
+        synthetic=material_result(1,synthetic_provenance=True)
+        wrapped=material_result(2,dependencies=(synthetic,))
+        derived=derive_result((wrapped,),3,direct_evidence_complete=True,
+            local_conditions_satisfied=True)
+        recomputed=recompute_result(derived,4,{})
+        for result in (synthetic,wrapped,derived,recomputed):
+            self.assertTrue(result.synthetic_provenance)
+            self.assertTrue(result.non_gating)
+        with self.assertRaises(ValueError):
+            replace(synthetic,non_gating=False)
+
+        authorization=GateAuthorization(GateIdentity.CONTROLLED_THREEFOLD,
+            "PROGRESS_TO_REALISTIC_COMPARISON",True,
+            synthetic_provenance=True)
+        authorized=derive_result((),5,direct_evidence_complete=True,
+            local_conditions_satisfied=True,gate_authorizations=(authorization,),
+            operation="PROGRESS_TO_REALISTIC_COMPARISON")
+        self.assertTrue(authorized.synthetic_provenance)
+        self.assertTrue(authorized.non_gating)
+        self.assertEqual(realistic_comparison_result(5,(),True,True,
+            (authorization,),real_claim=True).availability,Availability.UNAVAILABLE)
+
+        synthetic_node=material_result(1,synthetic_provenance=True)
+        laundering_wrapper=material_result(2,dependency_records={
+            "synthetic-node":synthetic_node.computation_artifact_hash})
+        with self.assertRaisesRegex(ValueError,"SYNTHETIC_PROVENANCE_INVALID"):
+            ArtifactRegistry({},
+                {"synthetic-node":(),"wrapper":("synthetic-node",)},
+                {"synthetic-node":synthetic_node,"wrapper":laundering_wrapper})
+
+    def test_repository_constants_cannot_mint_or_modify_grants(self):
+        """Copied metadata, hashes, and every public constant are not authority."""
+        root=synthetic_fixture_trust_root()
+        source=(CALC/"inverter_corrections.py").read_text(encoding="utf-8")
+        self.assertNotIn("_TRUST_TEST_",source)
+        self.assertNotIn("def trust_root_signing_",source)
+        self.assertNotIn("def make_trust_",source)
+        for artifact_type,owner in (("THERMAL_DYNAMIC_INPUT","InverterOwner"),
+                ("QUALIFICATION_STRESS","IndependentTestOwner"),
+                ("FIRMWARE_CONTROL_SOURCE","InverterOwner"),
+                ("PUBLICATION_CONTEXT","PublicationOwner")):
+            caller=RegisteredArtifact.create("CALLER-"+artifact_type,"1",artifact_type,
+                {"caller":"minted"},owner=owner,approval="APPROVED")
+            self.assertFalse(root.authorizes(caller))
+            with self.assertRaises(ValueError):
+                artifact_registry([caller],trust_root=root)
+            rejected=RegisteredArtifact.create("REJECTED-"+artifact_type,"1",artifact_type,
+                {"caller":"minted"},owner=owner,approval="REJECTED")
+            self.assertFalse(root.authorizes(rejected))
+
+        known,known_registry=thermal_artifact(True)
+        self.assertTrue(known_registry.trust_root.authorizes(known))
+        modified=RegisteredArtifact.create(known.artifact_id,known.version,
+            known.artifact_type,{**known.content,"caller_change":True},
+            owner=known.owner,approval=known.approval)
+        self.assertFalse(root.authorizes(modified))
+
+        new_grant=(modified.artifact_id,modified.version,modified.artifact_type,
+                   modified.artifact_hash)
+        grants=tuple(sorted((*root.grants,new_grant)))
+        payload={"root_id":root.root_id,"version":root.version,
+            "authority":root.authority,"approval":root.approval,
+            "grants":list(grants),"policies":list(root.policies)}
+        tampered=replace(root,grants=grants,root_hash=content_hash({**payload,
+            "authority_signature":root.authority_signature}))
+        with self.assertRaises(ValueError): tampered.validate()
+
+    def test_untrusted_artifacts_cannot_authorize_every_real_api(self):
+        thermal=RegisteredArtifact.create("FORGED-THERMAL","1","THERMAL_DYNAMIC_INPUT",
+            {},owner="InverterOwner",approval="APPROVED")
+        thermal_result=thermal_transient(temperatures(),domains(),{"junction":1,"case":1,"heatsink":1},
+            {"junction":1,"case":1,"heatsink":1},1,thermal.ref,registry=self._untrusted_registry([thermal]))
+        self.assertEqual(thermal_result.availability,Availability.UNAVAILABLE)
+
+        controlled=controlled_threefold(1,True,Fraction(3,5),2)
+        endpoint=endpoint_sensitivity([{"candidate_id":"a","current":1.0,"conduction_nonempty":True}],
+            CanonicalNumber.rational(1,"RESISTANCE","mOhm"),CanonicalNumber.rational(2,"RESISTANCE","mOhm"),
+            endpoint_evidence=True,policy=normative_ats(),fixed_inputs=True,closed_immutable_set=True)
+        with self.assertRaises(ValueError):
+            build_comparison_registry(tref(),valid_artifacts(controlled,endpoint),
+                prerequisite_trust_root=empty_trust_root())
+
+        stress=RegisteredArtifact.create("FORGED-STRESS","1","QUALIFICATION_STRESS",{},
+            owner="IndependentTestOwner",approval="APPROVED")
+        graph={"synthetic_marker":False,"nodes":[],"exact_device":"IRL40SC209",
+            "limit_refs":{name:stress.ref for name in QUALIFICATION_LIMITS},
+            "stress_ref":stress.ref,"dc_voltage":48,"derating_rule":"DERATE",
+            "operating_conditions":{"ambient":25}}
+        self.assertEqual(qualification_result(graph,real_claim=True,
+            registry=self._untrusted_registry([stress])).availability,Availability.UNAVAILABLE)
+
+        source=RegisteredArtifact.create("FORGED-FW","1","FIRMWARE_CONTROL_SOURCE",{},
+            owner="InverterOwner",approval="APPROVED")
+        test=RegisteredArtifact.create("FORGED-FW-TEST","1","FIRMWARE_CONTROL_TEST",{},
+            owner="IndependentSoftwareVerifier",approval="APPROVED")
+        bundle={"source_config_ref":source.ref,"deterministic_test_ref":test.ref}
+        self.assertEqual(control_axis_status("firmware",bundle,
+            self._untrusted_registry([source,test])).availability,Availability.UNAVAILABLE)
+
+        context=RegisteredArtifact.create("FORGED-PUB","1","PUBLICATION_CONTEXT",{},
+            owner="PublicationOwner",approval="APPROVED")
+        result=material_result(1,dependency_records={context.artifact_id:context.artifact_hash})
+        untrusted=self._untrusted_registry([context],{"result":result},{"result":(context.artifact_id,)})
+        self.assertEqual(publish({},result,registry=untrusted,result_id="result").availability,
+                         Availability.UNAVAILABLE)
+
+    def test_fixed_ratio_production_api_is_voltage_invariant(self):
+        """**Validates: Requirements 3.2**"""
+        cases=((1,18,Fraction(3000,230),(20,24,Fraction(126,5))),
+               (2,16,Fraction(125,12),(40,48,Fraction(273,5))),
+               (3,17,Fraction(37,4),(18,25,60)))
+        for primary,secondary,current,voltages in cases:
+            outputs=[fixed_ratio_primary_current(primary,secondary,current,
+                battery_voltage=voltage) for voltage in voltages]
+            self.assertTrue(all(value==outputs[0] for value in outputs))
+            self.assertEqual(outputs[0].fraction,
+                Fraction(secondary,primary)*current)
+
+    def test_no_load_rejects_forged_equivalent_settlement(self):
+        period=Fraction(2285,160_000_000); ats=normative_ats(); thresholds=make_test_thresholds(period)
+        observations={"window_seconds":thresholds.W_seconds,"ires_rms":0,
+            "vs_per_period":[0],"vs_cumulative":0,"end_energy":0,
+            "energy_sources":thresholds.closed_energy_sources}
+        artifacts=[registered_ats(ats),registered_thresholds(thresholds),
+                   registered_settling_observations("SETTLING-OBS-ADVERSARIAL",observations)]
+        base=artifact_registry(artifacts,trust_root=synthetic_fixture_trust_root())
+        classification=classify_settling(caller_settled=None,ats=ats,thresholds=thresholds,
+            period=period,observations=observations,registry=base,ats_ref=artifacts[0].ref,
+            thresholds_ref=artifacts[1].ref,observations_ref=artifacts[2].ref)
+        forged=material_result(copy.deepcopy(classification.decision.canonical_value),
+            dependency_records=dict(classification.decision.dependency_hashes),
+            synthetic_provenance=True,suffix="caller-forgery")
+        forged_registry=base.with_result("caller-forged-settlement",forged)
+        residual=material_result(CanonicalNumber.rational(0,"POWER","W"))
+        with self.assertRaisesRegex(ValueError,"CLASSIFY_SETTLING_PROVENANCE_REQUIRED"):
+            no_load_report("caller-forged-settlement",0,1,residual,registry=forged_registry)
+        report=no_load_report(classification.result_id,0,1,residual,
+                              registry=classification.registry)
+        self.assertEqual(len(report),len(NO_LOAD_CATEGORIES))
+
+    def test_validate_current_rejects_fresh_descendant_of_stale_result(self):
+        evidence_hash=content_hash("transitive-evidence")
+        a=replace(material_result(1,dependency_records={"evidence":evidence_hash}),
+                  freshness=Freshness.STALE)
+        b=material_result(2,dependency_records={"a":a.computation_artifact_hash})
+        registry=ArtifactRegistry({"evidence":evidence_hash},{"a":("evidence",),"b":("a",)},
+                                  {"a":a,"b":b},empty_trust_root())
+        self.assertFalse(registry.validate_current("b"))
+        self.assertEqual(consume_registered(registry,"b").availability,
+                         Availability.UNAVAILABLE)
 
 
 if __name__ == "__main__": unittest.main(verbosity=2)

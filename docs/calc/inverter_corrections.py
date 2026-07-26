@@ -166,6 +166,16 @@ class GateAuthorization:
     pass_claim: bool = False
     success_claim: bool = False
     diagnostic: Optional[str] = None
+    synthetic_provenance: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.synthetic_provenance) is not bool:
+            raise ValueError("synthetic authorization provenance must be boolean")
+
+    @property
+    def synthetic_only(self) -> bool:
+        """Compatibility name for callers that display fixture-only authorization."""
+        return self.synthetic_provenance
 
     def authorizes(self, operation: str) -> bool:
         if not self.valid or self.operation != operation:
@@ -213,7 +223,8 @@ class MaterialResult:
 def _trace(value: Any, deps: Sequence[MaterialResult], suffix: str = "") -> str:
     return content_hash({
         "value": canonical_json(value),
-        "deps": [(r.trace_identity, r.freshness.value, r.availability.value) for r in deps],
+        "deps": [(r.trace_identity, r.freshness.value, r.availability.value,
+                  getattr(r, "synthetic_provenance", False)) for r in deps],
         "suffix": suffix,
     })
 
@@ -229,6 +240,7 @@ def material_result(
     diagnostics: Sequence[str] = (),
     safety_relevant: bool = False,
     non_gating: bool = False,
+    synthetic_provenance: bool = False,
     suffix: str = "",
 ) -> MaterialResult:
     records = dict(dependency_records)
@@ -239,12 +251,25 @@ def material_result(
         availability = Availability.UNAVAILABLE
     elif any(d.availability is Availability.PROVISIONAL for d in dependencies) and availability is Availability.AVAILABLE:
         availability = Availability.PROVISIONAL
+    synthetic = synthetic_provenance or any(
+        getattr(dep, "synthetic_provenance", False) for dep in dependencies)
     artifact_hash = content_hash({"id": COMPUTATION_ARTIFACT_ID, "version": ARTIFACT_VERSION})
     return MaterialResult(
-        availability, freshness, tuple(sorted(records)), tuple(sorted(records.items())),
-        COMPUTATION_ARTIFACT_ID, ARTIFACT_VERSION, artifact_hash, value, applicability,
-        bound, _trace(value, dependencies, suffix), safety_relevant, non_gating,
-        tuple(diagnostics),
+        availability=availability,
+        freshness=freshness,
+        dependency_record_ids=tuple(sorted(records)),
+        dependency_hashes=tuple(sorted(records.items())),
+        computation_artifact_id=COMPUTATION_ARTIFACT_ID,
+        computation_artifact_version=ARTIFACT_VERSION,
+        computation_artifact_hash=artifact_hash,
+        canonical_value=value,
+        applicability=applicability,
+        uncertainty_or_bound=bound,
+        trace_identity=_trace(value, dependencies, suffix),
+        safety_relevant=safety_relevant,
+        non_gating=non_gating or synthetic,
+        diagnostics=tuple(diagnostics),
+        synthetic_provenance=synthetic,
     )
 
 
@@ -259,6 +284,8 @@ def derive_result(
     bound: Any = None,
     unrelated: bool = False,
 ) -> MaterialResult:
+    synthetic_authorization = (not unrelated and any(
+        auth.synthetic_provenance for auth in gate_authorizations))
     if not unrelated and operation:
         for auth in gate_authorizations:
             if not auth.authorizes(operation):
@@ -266,6 +293,7 @@ def derive_result(
                     ExplicitAbsence((auth.gate.value,), "invalid workflow authorization"),
                     Availability.UNAVAILABLE, dependencies=required,
                     diagnostics=(auth.diagnostic or "INVALID_WORKFLOW_AUTHORIZATION",),
+                    synthetic_provenance=synthetic_authorization,
                     suffix="authorization-blocked",
                 )
     if not local_conditions_satisfied or any(r.availability is Availability.UNAVAILABLE for r in required):
@@ -274,7 +302,9 @@ def derive_result(
         availability = Availability.PROVISIONAL if not isinstance(value, ExplicitAbsence) or bound is not None else Availability.UNAVAILABLE
     else:
         availability = Availability.AVAILABLE
-    return material_result(value, availability, dependencies=required, bound=bound, suffix="derived")
+    return material_result(value, availability, dependencies=required, bound=bound,
+                           synthetic_provenance=synthetic_authorization,
+                           suffix="derived")
 
 
 def invalidate_transitively(results: Mapping[str, MaterialResult], changed_record_id: str) -> dict[str, MaterialResult]:
@@ -294,7 +324,10 @@ def invalidate_transitively(results: Mapping[str, MaterialResult], changed_recor
 
 def recompute_result(old: MaterialResult, value: Any, dependency_records: Mapping[str, str]) -> MaterialResult:
     new = material_result(value, old.availability, dependency_records=dependency_records, applicability=old.applicability,
-                          bound=old.uncertainty_or_bound, diagnostics=old.diagnostics, suffix=old.trace_identity + ":recomputed")
+                          bound=old.uncertainty_or_bound, diagnostics=old.diagnostics,
+                          safety_relevant=old.safety_relevant, non_gating=old.non_gating,
+                          synthetic_provenance=getattr(old, "synthetic_provenance", False),
+                          suffix=old.trace_identity + ":recomputed")
     if new.trace_identity == old.trace_identity:
         raise ValueError("fresh recomputation requires new trace identity")
     return new
@@ -1150,10 +1183,27 @@ def validate_comparison_registry(t_ref: Mapping[str,Any], artifacts: Sequence[Ma
 
 
 def realistic_comparison_result(local_value: Any, local_inputs: Sequence[MaterialResult], direct_evidence_complete: bool,
-                                local_conditions_satisfied: bool, authorizations: Sequence[GateAuthorization]) -> MaterialResult:
-    return derive_result(local_inputs,local_value,direct_evidence_complete=direct_evidence_complete,
+                                local_conditions_satisfied: bool, authorizations: Sequence[GateAuthorization],
+                                *, real_claim: bool = False) -> MaterialResult:
+    synthetic = (any(auth.synthetic_only for auth in authorizations)
+                 or any(getattr(item, "synthetic_provenance", False)
+                        for item in local_inputs))
+    if real_claim and synthetic:
+        return material_result(ExplicitAbsence(("synthetic_provenance",),
+            "synthetic comparison provenance cannot support a real claim"),
+            Availability.UNAVAILABLE, dependencies=local_inputs,
+            diagnostics=("SYNTHETIC_PUBLICATION_REJECTED",), non_gating=True,
+            synthetic_provenance=synthetic)
+    result = derive_result(local_inputs,local_value,direct_evidence_complete=direct_evidence_complete,
                          local_conditions_satisfied=local_conditions_satisfied,gate_authorizations=authorizations,
                          operation="PROGRESS_TO_REALISTIC_COMPARISON")
+    if synthetic and not result.synthetic_provenance:
+        result = material_result(result.canonical_value, result.availability,
+            dependencies=local_inputs, applicability=result.applicability,
+            bound=result.uncertainty_or_bound, diagnostics=result.diagnostics,
+            safety_relevant=result.safety_relevant, non_gating=True,
+            synthetic_provenance=True, suffix="synthetic-comparison")
+    return result
 
 
 def reconcile_comparison(fixed_buckets: Mapping[str,Fraction], thermal_buckets: Mapping[str,Fraction], realistic_delta: Fraction,
@@ -2374,18 +2424,20 @@ def _validate_endpoint_outcome(outcome: Mapping[str,Any], registry: ArtifactRegi
 
 def validate_comparison_registry(registry: Any, artifacts: Sequence[Mapping[str,Any]]=()) -> tuple[tuple[GateAuthorization,...],tuple[str,...]]:
     diagnostics=[]
-    if not isinstance(registry,ComparisonArtifactRegistry):
+    if type(registry) is not ComparisonArtifactRegistry:
         diagnostics.append("COMPARISON_IMMUTABLE_REGISTRY_REQUIRED")
     else:
-        try: registry.prerequisite_registry.validate_closed_dag()
-        except ValueError: diagnostics.append("COMPARISON_PREREQUISITE_REGISTRY_INVALID")
+        try:
+            _require_exact_registry(registry.prerequisite_registry)
+        except (TypeError, ValueError):
+            diagnostics.append("COMPARISON_PREREQUISITE_REGISTRY_INVALID")
         body={"registry_id":registry.registry_id,"t_ref":registry.t_ref,"artifacts":list(registry.artifacts),
               "prerequisite_hashes":sorted((k,_artifact_digest(v)) for k,v in registry.prerequisite_registry.artifacts.items()),
               "t_ref_frozen_at":registry.t_ref_frozen_at,"gate_frozen_at":list(registry.gate_frozen_at),"realistic_execution_at":registry.realistic_execution_at}
         if registry.registry_hash!=content_hash(body): diagnostics.append("COMPARISON_REGISTRY_HASH_MISMATCH")
     if diagnostics:
         return tuple(GateAuthorization(g,"PROGRESS_TO_REALISTIC_COMPARISON",False,diagnostic=";".join(diagnostics)) for g in GateIdentity),tuple(diagnostics)
-    assert isinstance(registry,ComparisonArtifactRegistry)
+    assert type(registry) is ComparisonArtifactRegistry
     t_ref=registry.t_ref; gate_artifacts=registry.artifacts
     valid_tref=(set(t_ref)=={"value","unit","baseline_domain","replacement_domain","artifact_hash"}
         and isinstance(t_ref.get("value"),(int,float)) and math.isfinite(t_ref["value"])
@@ -2420,7 +2472,8 @@ def validate_comparison_registry(registry: Any, artifacts: Sequence[Mapping[str,
     for artifact in gate_artifacts:
         gate=GateIdentity(artifact["gate"]); outcome=artifact["outcomes"][0]; ineligible=outcome["kind"]=="INELIGIBILITY"
         auth.append(GateAuthorization(gate,"PROGRESS_TO_REALISTIC_COMPARISON",True,ineligible,
-                                      outcome.get("completion_claim",False),outcome.get("pass_claim",False),outcome.get("success_claim",False)))
+                                      outcome.get("completion_claim",False),outcome.get("pass_claim",False),outcome.get("success_claim",False),
+                                      synthetic_provenance=registry.prerequisite_registry.trust_root.synthetic_only))
     return tuple(sorted(auth,key=lambda x:x.gate.value)),()
 
 
@@ -2433,6 +2486,7 @@ def thermal_transient(temperatures: Mapping[str,float], domains: Mapping[str,tup
                       registry: Optional[ArtifactRegistry]=None) -> MaterialResult:
     try:
         if registry is None: raise ValueError("trusted registry required")
+        registry, trust_root = _require_exact_registry(registry)
         artifact=registry.resolve(method_artifact,"THERMAL_DYNAMIC_INPUT",_DYNAMIC_THERMAL_SCHEMA)
         c=artifact.content
         supplied={"temperatures":dict(temperatures),"domains":dict(domains),"cth":dict(cth),"rth":dict(rth),"elapsed":elapsed,"hot_start":hot_start}
@@ -2449,7 +2503,7 @@ def thermal_transient(temperatures: Mapping[str,float], domains: Mapping[str,tup
             result[node]=temperatures[node]+elapsed*float(c["applied_power"][node])/cth[node]
             if not domains[node][0]<=result[node]<=domains[node][1]:
                 return material_result(ExplicitAbsence((node,),"thermal domain exit"),Availability.UNAVAILABLE,diagnostics=("THERMAL_DOMAIN_EXIT",),non_gating=True)
-        return material_result({"mode":"HOT_START_TRANSIENT" if hot_start else "TRANSIENT","temperatures":result,"elapsed":elapsed},dependency_records={artifact.artifact_id:artifact.artifact_hash})
+        return material_result({"mode":"HOT_START_TRANSIENT" if hot_start else "TRANSIENT","temperatures":result,"elapsed":elapsed},dependency_records={artifact.artifact_id:artifact.artifact_hash},non_gating=trust_root.synthetic_only,synthetic_provenance=trust_root.synthetic_only)
     except Exception as exc:
         return material_result(ExplicitAbsence(("dynamic_thermal_data",),str(exc)),Availability.UNAVAILABLE,diagnostics=("THERMAL_DYNAMICS_UNAVAILABLE",),non_gating=True)
 
@@ -2513,6 +2567,9 @@ def qualification_result(graph: Mapping[str,Any], *, real_claim: bool,
         if isinstance(nodes,Sequence) and any(not isinstance(n,Mapping) or n.get("synthetic_marker") is not synthetic for n in nodes): raise ValueError("synthetic-real graph mixing")
         if synthetic and real_claim: raise ValueError("synthetic fixture cannot support real claim")
         if registry is None: raise ValueError("trusted registry required")
+        registry, trust_root = _require_exact_registry(registry)
+        if trust_root.synthetic_only and not synthetic:
+            raise ValueError("synthetic fixture trust root requires synthetic marker")
         if set(graph)!=required_graph or set(graph["limit_refs"])!=set(QUALIFICATION_LIMITS): raise ValueError("qualification graph schema")
         failed=[]; deps={}
         stress=registry.resolve(graph["stress_ref"],"QUALIFICATION_STRESS",_STRESS_CONTENT_SCHEMA)
@@ -2530,7 +2587,7 @@ def qualification_result(graph: Mapping[str,Any], *, real_claim: bool,
             passed=observed<=c["value"] if c["pass_rule"]=="<=" else observed>=c["value"] if c["pass_rule"]==">=" else False
             if not passed: failed.append(name)
             deps[artifact.artifact_id]=artifact.artifact_hash
-        return material_result({"qualified":not failed,"failed":failed,"exact_device":graph["exact_device"]},dependency_records=deps,non_gating=synthetic)
+        return material_result({"qualified":not failed,"failed":failed,"exact_device":graph["exact_device"]},dependency_records=deps,non_gating=synthetic,synthetic_provenance=trust_root.synthetic_only or synthetic)
     except Exception as exc:
         diagnostic=("SYNTHETIC_REAL_MIX" if "synthetic-real" in str(exc) else
                     "SYNTHETIC_PUBLICATION_REJECTED" if "synthetic fixture" in str(exc) else
@@ -2547,6 +2604,7 @@ def control_axis_status(axis: str, evidence: Optional[Mapping[str,Any]],
     if axis not in ("firmware","hardware"): raise ValueError("unknown control axis")
     try:
         if evidence is None or registry is None: raise ValueError("trusted complete evidence required")
+        registry, trust_root = _require_exact_registry(registry)
         if axis=="firmware":
             if set(evidence)!={"source_config_ref","deterministic_test_ref"}: raise ValueError("firmware bundle schema")
             source=registry.resolve(evidence["source_config_ref"],"FIRMWARE_CONTROL_SOURCE",_FW_CONTROL_SCHEMA)
@@ -2559,7 +2617,7 @@ def control_axis_status(axis: str, evidence: Optional[Mapping[str,Any]],
             test=registry.resolve(evidence["test_ref"],"HARDWARE_CONTROL_TEST",_HW_CONTROL_SCHEMA); c=test.content
             if not all(c[k] for k in ("exact_hardware_identity","firmware_config_hash","instruments_calibration","conditions","waveform_coverage","limits","requirement")): raise ValueError("hardware content incomplete")
             passed=c["passed"] is True; deps={test.artifact_id:test.artifact_hash}
-        return material_result(ControlStatus.VERIFIED.value if passed else ControlStatus.UNVERIFIED.value,Availability.AVAILABLE,dependency_records=deps,diagnostics=() if passed else ("named verification predicate failed",),suffix=axis)
+        return material_result(ControlStatus.VERIFIED.value if passed else ControlStatus.UNVERIFIED.value,Availability.AVAILABLE,dependency_records=deps,diagnostics=() if passed else ("named verification predicate failed",),non_gating=trust_root.synthetic_only,synthetic_provenance=trust_root.synthetic_only,suffix=axis)
     except Exception as exc:
         return material_result(ControlStatus.UNAVAILABLE.value,Availability.UNAVAILABLE,diagnostics=(str(exc),),non_gating=True,suffix=axis)
 
@@ -2576,11 +2634,17 @@ def publish(claim: Mapping[str,Any], material: MaterialResult, *, real_claim: bo
             registry: Optional[ArtifactRegistry]=None, result_id: Optional[str]=None) -> MaterialResult:
     diagnostics=[]
     try:
-        if registry is None or result_id is None or not registry.validate_current(result_id): raise ValueError("fresh registered result required")
+        if registry is None or result_id is None: raise ValueError("fresh registered result required")
+        registry, trust_root = _require_exact_registry(registry)
+        if not registry.validate_current(result_id): raise ValueError("fresh registered result required")
+        if real_claim and (trust_root.synthetic_only or material.synthetic_provenance):
+            raise ValueError("synthetic provenance cannot support a real claim")
         if registry.results[result_id] != material: raise ValueError("material/result mismatch")
         if set(claim)!=PUBLICATION_FIELDS|{"publication_context_ref"}: raise ValueError("publication schema must be exact")
         context=registry.resolve(claim["publication_context_ref"],"PUBLICATION_CONTEXT",_PUBLICATION_CONTEXT_SCHEMA)
         c=context.content
+        if c.get("synthetic_marker") is not material.synthetic_provenance:
+            raise ValueError("publication synthetic provenance mismatch")
         if not c["boundary"] or not c["assumption_variant"] or not c["result_basis"]: raise ValueError("empty publication semantics")
         for ref_name in ("ats_ref","evidence_conflict_ref","digital_oracle_ref","analog_status_ref"):
             resolved=registry.resolve(c[ref_name])
@@ -2605,7 +2669,8 @@ def publish(claim: Mapping[str,Any], material: MaterialResult, *, real_claim: bo
         diagnostics.append(str(exc))
     if diagnostics:
         return material_result(ExplicitAbsence(tuple(diagnostics),"publication rejected"),Availability.UNAVAILABLE,diagnostics=("PUBLICATION_REJECTED",))
-    return material_result(copy.deepcopy(dict(claim)),material.availability,dependencies=(material,),suffix="published")
+    assert registry is not None
+    return material_result(copy.deepcopy(dict(claim)),material.availability,dependencies=(material,),non_gating=trust_root.synthetic_only,synthetic_provenance=material.synthetic_provenance,suffix="published")
 
 
 
@@ -2651,3 +2716,753 @@ def independent_expected_timing(p: int) -> TimingVector:
 
 def digital_oracle(p: int, polarity: int = 1) -> TimingVector:
     return compute_timing_from_firmware(p,polarity)
+
+
+
+# ========================= Independent re-review hardening =========================
+# The trust root is a separate immutable input.  Artifact content hashes prove
+# identity only; they do not confer owner approval or registration authority.
+import hmac
+import secrets
+
+
+@dataclass(frozen=True)
+class MaterialResult:
+    availability: Availability
+    freshness: Freshness
+    dependency_record_ids: tuple[str, ...]
+    dependency_hashes: tuple[tuple[str, str], ...]
+    computation_artifact_id: str
+    computation_artifact_version: str
+    computation_artifact_hash: str
+    canonical_value: Any
+    applicability: str
+    uncertainty_or_bound: Any
+    trace_identity: str
+    safety_relevant: bool = False
+    non_gating: bool = False
+    diagnostics: tuple[str, ...] = ()
+    producer_kind: Optional[str] = None
+    provenance_seal: Optional[str] = None
+    synthetic_provenance: bool = False
+
+    def __post_init__(self) -> None:
+        ids = tuple(sorted(set(self.dependency_record_ids)))
+        hashes = tuple(sorted(self.dependency_hashes))
+        if ids != self.dependency_record_ids or hashes != self.dependency_hashes:
+            raise ValueError("dependencies must be canonical ordered unique sets/maps")
+        if tuple(k for k, _ in hashes) != ids:
+            raise ValueError("dependency IDs and hashes differ")
+        if type(self.synthetic_provenance) is not bool:
+            raise ValueError("synthetic provenance must be an explicit boolean")
+        if self.synthetic_provenance and not self.non_gating:
+            raise ValueError("synthetic provenance must remain non-gating")
+        if (self.availability is Availability.PROVISIONAL
+                and isinstance(self.canonical_value, ExplicitAbsence)
+                and self.uncertainty_or_bound is None):
+            raise ValueError("absent value without evaluable bound cannot be provisional")
+        if not self.trace_identity or len(self.computation_artifact_hash) != 64:
+            raise ValueError("incomplete trace identity")
+
+    def consumable(self) -> bool:
+        return (self.freshness is Freshness.FRESH
+                and self.availability is not Availability.UNAVAILABLE)
+
+
+@dataclass(frozen=True)
+class RegisteredArtifact:
+    artifact_id: str
+    version: str
+    artifact_type: str
+    content: Mapping[str, Any]
+    artifact_hash: str
+    owner: str = "UNTRUSTED_CALLER"
+    approval: str = "UNAPPROVED"
+
+    @staticmethod
+    def create(artifact_id: str, version: str, artifact_type: str,
+               content: Mapping[str, Any], *, owner: str = "UNTRUSTED_CALLER",
+               approval: str = "UNAPPROVED") -> "RegisteredArtifact":
+        frozen = copy.deepcopy(dict(content))
+        digest = content_hash({"artifact_id": artifact_id, "version": version,
+                               "artifact_type": artifact_type, "content": frozen,
+                               "owner": owner, "approval": approval})
+        return RegisteredArtifact(artifact_id, version, artifact_type, frozen,
+                                  digest, owner, approval)
+
+    @property
+    def ref(self) -> dict[str, str]:
+        return {"artifact_id": self.artifact_id, "version": self.version,
+                "hash": self.artifact_hash}
+
+    def validate_identity(self) -> None:
+        expected = content_hash({"artifact_id": self.artifact_id,
+                                 "version": self.version,
+                                 "artifact_type": self.artifact_type,
+                                 "content": self.content, "owner": self.owner,
+                                 "approval": self.approval})
+        if (not _substantive(self.artifact_id) or not _substantive(self.version)
+                or not _substantive(self.artifact_type)
+                or self.artifact_hash != expected or not valid_sha256(expected)):
+            raise ValueError("ARTIFACT_CONTENT_HASH_INVALID")
+
+    # Compatibility alias.  Identity validation deliberately does not establish trust.
+    def validate(self) -> None:
+        self.validate_identity()
+
+
+_TRUST_POLICIES: dict[str, tuple[str, str]] = {
+    "CONTROLLED_PREREQUISITES": ("InverterOwner", "APPROVED"),
+    "ENDPOINT_PREREQUISITES": ("InverterOwner", "APPROVED"),
+    "THERMAL_DYNAMIC_INPUT": ("InverterOwner", "APPROVED"),
+    "ATS_V2": ("InverterOwner", "SPEC_NORMATIVE_APPROVAL"),
+    "PRODUCT_THRESHOLDS": ("InverterOwner", "APPROVED"),
+    "SETTLING_OBSERVATIONS": ("IndependentTestOwner", "APPROVED"),
+    "QUALIFICATION_LIMIT": ("ManufacturerEvidenceOwner", "APPROVED"),
+    "QUALIFICATION_STRESS": ("IndependentTestOwner", "APPROVED"),
+    "FIRMWARE_CONTROL_SOURCE": ("InverterOwner", "APPROVED"),
+    "FIRMWARE_CONTROL_TEST": ("IndependentSoftwareVerifier", "APPROVED"),
+    "HARDWARE_CONTROL_TEST": ("IndependentHardwareVerifier", "APPROVED"),
+    "PUBLICATION_CONTEXT": ("PublicationOwner", "APPROVED"),
+    "ATS": ("InverterOwner", "SPEC_NORMATIVE_APPROVAL"),
+    "EVIDENCE_CONFLICT": ("EvidenceAdjudicationOwner", "APPROVED"),
+    "DIGITAL_ORACLE": ("InverterOwner", "APPROVED"),
+    "ANALOG_STATUS": ("IndependentModelReviewer", "APPROVED"),
+}
+
+
+_TRUST_ROOT_RSA_N = 730152951967952006233465909416958243559225075993434964142225380997947520074164275005581686622247496434560845926090451931114157462658545853239349077782706805574124421323672429531783281342209443993732025953648637999833865691174781849
+_TRUST_ROOT_RSA_E = 65537
+
+# Repository trust is closed. Only these exact, externally pre-signed manifests can
+# be loaded; repository code contains no signing credential and accepts no caller-
+# supplied grant list. The non-empty manifest is explicitly synthetic and can only
+# exercise non-real test paths.
+_EMPTY_TRUST_ROOT_SIGNATURE = "6510bba3a27f974425a57289c4d58dc536ce40ae687903781622da9fe40c244fde75b8547f8739f28467b521f3a7db37ea845d889ecd4d3a3fa1ddbfeb07d698169f29a4f6f41ec87c5d05e09ff500c83a2980f5dcb8ee7f2b25a34d121a51e5"
+_SYNTHETIC_FIXTURE_TRUST_ROOT_SIGNATURE = "54bccd0aa18c04b38c777e3f4be5db2cfa243f5e349a1f0dcc2648b7070a18c202b59fe114a66cca47945e310c1545d54f523a9ebfc00157e0dda8946856b6f93b2f043407f1b654d35b36910047db8d63236c0043ca045f6b8a149ea172f9b1"
+_SYNTHETIC_FIXTURE_GRANTS = (
+    ("ANALOG-REF", "1", "ANALOG_STATUS", "1c332cfee7145406919d67acbaba9dbd04835e2b95cd46844c7de68e9643ad9d"),
+    ("ATS-REF", "1", "ATS", "5d8cf651f5d7963abee5b58229e3792cfd3f9aa3f76bd9e328017740e42da9bf"),
+    ("ATS-v2", "2.0.0", "ATS_V2", "7f61862fbcd2b4b60c5c352442731e5c018e5730b9d490f90463d0bbab92ec0d"),
+    ("CONTROLLED_PREREQUISITES-288c0572b4be1aa7", "1.0.0", "CONTROLLED_PREREQUISITES", "f6a613bfb52afa5a15ea31e5d6f2fcb8a6c42bcf473dc1b8936805ebee8d6b60"),
+    ("CONTROLLED_PREREQUISITES-8a78ebf952c9ee25", "1.0.0", "CONTROLLED_PREREQUISITES", "fb810fdfa6c244e7a04516279ec48f8f500ae8d1911b13a9aa87f0ff49c5aa04"),
+    ("CONTROLLED_PREREQUISITES-b89138cd17443286", "1.0.0", "CONTROLLED_PREREQUISITES", "1ae43e7a9f14a5ae8ba62a0da87b53c085478fe842a39010976e5074655d3501"),
+    ("CONTROLLED_PREREQUISITES-d8e83231019dcb5c", "1.0.0", "CONTROLLED_PREREQUISITES", "b3bc9eafc68bef195588c3b4581d8a50714efcaad998d18ddbaddc86be994b0a"),
+    ("ENDPOINT_PREREQUISITES-172982b5559403b6", "1.0.0", "ENDPOINT_PREREQUISITES", "b29f5c703c91e0ce2c596bc3c52b7519ec8338ad94f9f8b4d2428ee25e8a6214"),
+    ("ENDPOINT_PREREQUISITES-2f189ac64e49c878", "1.0.0", "ENDPOINT_PREREQUISITES", "57a26256b2453d93139af6fa62989198ba947d8deb1cba5570c2dab3ef4f34b0"),
+    ("ENDPOINT_PREREQUISITES-7b5e11d880fcea33", "1.0.0", "ENDPOINT_PREREQUISITES", "128bc54f6df3ccc8939751da9d8e45af2a456d5b2e360c4f635e08c86b923099"),
+    ("ENDPOINT_PREREQUISITES-a6ba3b4857baa90b", "1.0.0", "ENDPOINT_PREREQUISITES", "9581c539c4d522d4a88d549ddead95c362041de67479853603ccaff6b239a519"),
+    ("EVIDENCE-REF", "1", "EVIDENCE_CONFLICT", "8f30746748696593b22ab517d0dd52169dc8d8b4e18099143bee89038472071a"),
+    ("FW-EMPTY", "1", "FIRMWARE_CONTROL_SOURCE", "b40992f48e3e5d542758eea17f18c6de3193c276bb0a91e975416214d23b355b"),
+    ("FW-SOURCE", "1", "FIRMWARE_CONTROL_SOURCE", "f8a9a0149d4a3922880084513493290c16728f7e71504ee5b3fd15df10ca363a"),
+    ("FW-TEST", "1", "FIRMWARE_CONTROL_TEST", "70f9d5ccae10d48a6c34c2218d4c124fdcd3412b70658eee3cc33eaafd9ec7a6"),
+    ("HW-TEST", "1", "HARDWARE_CONTROL_TEST", "79ce79eb027b5e5192bdb1394be6fd1663fe24454df79fa445d014612c321e68"),
+    ("ORACLE-REF", "1", "DIGITAL_ORACLE", "c75d1e82838095755ef6955a5ed880f475b883a5ebb0110eda1e58d9ed60fb2b"),
+    ("PUB-CONTEXT", "1", "PUBLICATION_CONTEXT", "2520beca76ca0b2e5b491ef859c6ebb93882bf04aa33ff389273db8881161e90"),
+    ("SETTLING-OBS-ADVERSARIAL", "1.0.0", "SETTLING_OBSERVATIONS", "c26e4a2f74b37db6efac9b0689a93dd1fc540b3d7a013043147eaf8b1c7e9e48"),
+    ("SETTLING-OBS-FAIL", "1.0.0", "SETTLING_OBSERVATIONS", "42b38e27002396da706c8c16e3fc36b426a3fecf92693f97e251fccd9b2e4f05"),
+    ("SETTLING-OBS-NOLOAD", "1.0.0", "SETTLING_OBSERVATIONS", "79892877141750f11d5be3a41d65e93bd7d67d3f2ade9076d2cb101b770a23ec"),
+    ("SETTLING-OBS-PASS", "1.0.0", "SETTLING_OBSERVATIONS", "0b794e4d372ba1e48d514816075554fc0083cd6ac7e6bec2d29565bca1a3f955"),
+    ("STRIPPED", "1", "CONTROLLED_PREREQUISITES", "da23d53c8b7b550bc22b89e26f2cce7471b4507cc957d0585ae557d190846e00"),
+    ("SYNTH-QUAL-LIMIT-AVALANCHE", "1", "QUALIFICATION_LIMIT", "7f5ef91c6593e65a34d2910c160096c0226db33e6368775b7866f276660b5deb"),
+    ("SYNTH-QUAL-LIMIT-CURRENT", "1", "QUALIFICATION_LIMIT", "4b53869c068460c4069bf08856f004c500cab52648244b9805174fab07b4a0e3"),
+    ("SYNTH-QUAL-LIMIT-DECLARED_LIMITS", "1", "QUALIFICATION_LIMIT", "5a4de1ae4119952e59bef72ce89d90e38145de9deb76bfbece32ca1734b7f1e0"),
+    ("SYNTH-QUAL-LIMIT-PACKAGE_ISOLATION", "1", "QUALIFICATION_LIMIT", "409f2f017f526ce7c89c0365fd32fa548c1c3b5e66d2e06cdf538d745b18ea2b"),
+    ("SYNTH-QUAL-LIMIT-SOA", "1", "QUALIFICATION_LIMIT", "07a5f192e75db2c1beecb2eaa50876cc8191cde5c3284e9b03acc6e8f8f37c7b"),
+    ("SYNTH-QUAL-LIMIT-THERMAL", "1", "QUALIFICATION_LIMIT", "65247e8ec200de6a376314b057447bbf0c7bde7d3c24d1522dc3979f5d0970d3"),
+    ("SYNTH-QUAL-LIMIT-VOLTAGE", "1", "QUALIFICATION_LIMIT", "0c11a81191521b5126dc89fc07f73528593f2667033c28fb8eeb72d291a02e21"),
+    ("SYNTH-QUAL-STRESS", "1", "QUALIFICATION_STRESS", "e60a66f6ee607f477d99ef7a31e93e0fef8df4f15881d4890474b8f616102286"),
+    ("SYNTHETIC-THRESHOLD-FIXTURE", "1", "PRODUCT_THRESHOLDS", "1731ccf5c1baa5dd898884f36ed1040a9a6cc3b28864672c1cbadf91ddc7a314"),
+    ("THERMAL-DYNAMIC-001", "1", "THERMAL_DYNAMIC_INPUT", "251973615cc988242118d3b9bcb8d377260e0a6956a287b5602729870995e71e"),
+    ("UNRELATED", "1", "CONTROLLED_PREREQUISITES", "68a649543b13a902a0bc67f5870c7a74807994b8e43dd8e5a46ee6179f40c83c"),
+)
+_FIXED_TRUST_ROOTS = {
+    "INVERTER-ARTIFACT-TRUST-ROOT": {
+        "version":"1.0.0", "grants":(),
+        "signature":_EMPTY_TRUST_ROOT_SIGNATURE,
+        "root_hash":"7f1ebf07bca0311dc0ccb443e170b3ba0e4dc0f63714beadf4ff020945e353dc",
+        "synthetic_only":False,
+    },
+    "INVERTER-SYNTHETIC-FIXTURE-TRUST-ROOT": {
+        "version":"1.0.0", "grants":_SYNTHETIC_FIXTURE_GRANTS,
+        "signature":_SYNTHETIC_FIXTURE_TRUST_ROOT_SIGNATURE,
+        "root_hash":"91d172d5758bb41e1698993b45684f25ba4e32b3fb396708ad61ad2eba32c628",
+        "synthetic_only":True,
+    },
+}
+
+
+@dataclass(frozen=True)
+class ArtifactTrustRoot:
+    root_id: str
+    version: str
+    authority: str
+    approval: str
+    grants: tuple[tuple[str, str, str, str], ...]
+    policies: tuple[tuple[str, str, str], ...]
+    authority_signature: str
+    root_hash: str
+
+    @property
+    def synthetic_only(self) -> bool:
+        manifest = _FIXED_TRUST_ROOTS.get(self.root_id)
+        return bool(manifest and manifest["synthetic_only"])
+
+    def validate(self) -> None:
+        expected_policies = tuple(sorted((kind, owner, approval)
+                                         for kind, (owner, approval)
+                                         in _TRUST_POLICIES.items()))
+        manifest = _FIXED_TRUST_ROOTS.get(self.root_id)
+        payload = {"root_id": self.root_id, "version": self.version,
+                   "authority": self.authority, "approval": self.approval,
+                   "grants": list(self.grants), "policies": list(self.policies)}
+        try:
+            signature = int(self.authority_signature, 16)
+        except (TypeError, ValueError):
+            signature = -1
+        signature_valid = (0 < signature < _TRUST_ROOT_RSA_N
+                           and pow(signature, _TRUST_ROOT_RSA_E,
+                                   _TRUST_ROOT_RSA_N) == int(content_hash(payload), 16))
+        exact_manifest = (manifest is not None
+            and self.version == manifest["version"]
+            and self.grants == manifest["grants"]
+            and self.authority_signature == manifest["signature"]
+            and self.root_hash == manifest["root_hash"])
+        if (not exact_manifest
+                or self.authority != "RepositoryTrustAdministrator"
+                or self.approval != "TRUST_ROOT_APPROVED"
+                or self.policies != expected_policies
+                or tuple(sorted(set(self.grants))) != self.grants
+                or self.root_hash != content_hash({**payload,
+                    "authority_signature":self.authority_signature})
+                or not signature_valid):
+            raise ValueError("ARTIFACT_TRUST_ROOT_INVALID")
+
+    def authorizes(self, artifact: RegisteredArtifact) -> bool:
+        if type(self) is not ArtifactTrustRoot:
+            return False
+        try:
+            self.validate()
+            artifact.validate_identity()
+        except (TypeError, ValueError):
+            return False
+        policy = _TRUST_POLICIES.get(artifact.artifact_type)
+        identity = (artifact.artifact_id, artifact.version,
+                    artifact.artifact_type, artifact.artifact_hash)
+        return (policy == (artifact.owner, artifact.approval)
+                and identity in self.grants)
+
+
+def _fixed_trust_root(root_id: str) -> ArtifactTrustRoot:
+    manifest = _FIXED_TRUST_ROOTS[root_id]
+    policies = tuple(sorted((kind, owner, status)
+                            for kind, (owner, status) in _TRUST_POLICIES.items()))
+    root = ArtifactTrustRoot(root_id, manifest["version"],
+        "RepositoryTrustAdministrator", "TRUST_ROOT_APPROVED",
+        manifest["grants"], policies, manifest["signature"],
+        manifest["root_hash"])
+    root.validate()
+    return root
+
+
+def empty_trust_root() -> ArtifactTrustRoot:
+    return _fixed_trust_root("INVERTER-ARTIFACT-TRUST-ROOT")
+
+
+def synthetic_fixture_trust_root() -> ArtifactTrustRoot:
+    """Return the closed, pre-signed allowlist for non-real test fixtures only."""
+    return _fixed_trust_root("INVERTER-SYNTHETIC-FIXTURE-TRUST-ROOT")
+
+
+def _require_exact_trust_root(trust_root: Any) -> ArtifactTrustRoot:
+    """Reject subclasses and duck types before any trust decision is attempted."""
+    if type(trust_root) is not ArtifactTrustRoot:
+        raise ValueError("ARTIFACT_TRUST_ROOT_EXACT_TYPE_REQUIRED")
+    trust_root.validate()
+    return trust_root
+
+
+def _artifact_digest(value: Any) -> Optional[str]:
+    if isinstance(value, RegisteredArtifact):
+        value.validate_identity()
+        return value.artifact_hash
+    return value if valid_sha256(value) else None
+
+
+_SETTLEMENT_SEAL_KEY = secrets.token_bytes(32)
+_SETTLEMENT_PRODUCER = "CLASSIFY_SETTLING_V1"
+
+
+def _settlement_payload(result: MaterialResult) -> bytes:
+    return canonical_json({
+        "availability": result.availability,
+        "freshness": result.freshness,
+        "dependency_hashes": result.dependency_hashes,
+        "canonical_value": result.canonical_value,
+        "trace_identity": result.trace_identity,
+        "producer_kind": result.producer_kind,
+        "synthetic_provenance": result.synthetic_provenance,
+    }).encode("utf-8")
+
+
+def _seal_settlement(result: MaterialResult) -> MaterialResult:
+    marked = replace(result, producer_kind=_SETTLEMENT_PRODUCER,
+                     provenance_seal=None)
+    seal = hmac.new(_SETTLEMENT_SEAL_KEY, _settlement_payload(marked),
+                    hashlib.sha256).hexdigest()
+    return replace(marked, provenance_seal=seal)
+
+
+def _valid_settlement_seal(result: MaterialResult) -> bool:
+    if (result.producer_kind != _SETTLEMENT_PRODUCER
+            or not valid_sha256(result.provenance_seal)):
+        return False
+    unsigned = replace(result, provenance_seal=None)
+    expected = hmac.new(_SETTLEMENT_SEAL_KEY, _settlement_payload(unsigned),
+                        hashlib.sha256).hexdigest()
+    return hmac.compare_digest(result.provenance_seal, expected)
+
+
+@dataclass(frozen=True)
+class ArtifactRegistry:
+    artifacts: Mapping[str, Any]
+    dependencies: Mapping[str, tuple[str, ...]]
+    results: Mapping[str, MaterialResult]
+    trust_root: ArtifactTrustRoot = field(default_factory=empty_trust_root)
+
+    def __post_init__(self) -> None:
+        if type(self) is not ArtifactRegistry:
+            raise ValueError("ARTIFACT_REGISTRY_EXACT_TYPE_REQUIRED")
+        _require_exact_trust_root(self.trust_root)
+        self.validate_closed_dag()
+
+    def resolve(self, ref: Any, artifact_type: Optional[str] = None,
+                required_schema: Optional[set[str]] = None) -> RegisteredArtifact:
+        if type(self) is not ArtifactRegistry:
+            raise ValueError("ARTIFACT_REGISTRY_EXACT_TYPE_REQUIRED")
+        trust_root = _require_exact_trust_root(self.trust_root)
+        if not _artifact_ref_valid(ref):
+            raise ValueError("ARTIFACT_REFERENCE_INVALID")
+        record = self.artifacts.get(ref["artifact_id"])
+        if not isinstance(record, RegisteredArtifact):
+            raise ValueError("ARTIFACT_CONTENT_NOT_REGISTERED")
+        if not trust_root.authorizes(record):
+            raise ValueError("ARTIFACT_TRUST_POLICY_REJECTED")
+        if (record.version != ref["version"] or record.artifact_hash != ref["hash"]
+                or (artifact_type is not None
+                    and record.artifact_type != artifact_type)):
+            raise ValueError("ARTIFACT_REFERENCE_MISMATCH")
+        if required_schema is not None and set(record.content) != required_schema:
+            raise ValueError("ARTIFACT_SCHEMA_INCOMPLETE")
+        return record
+
+    def validate_closed_dag(self) -> None:
+        if type(self) is not ArtifactRegistry:
+            raise ValueError("ARTIFACT_REGISTRY_EXACT_TYPE_REQUIRED")
+        trust_root = _require_exact_trust_root(self.trust_root)
+        artifact_ids = set(self.artifacts)
+        result_ids = set(self.results)
+        if artifact_ids & result_ids:
+            raise ValueError("DEPENDENCY_DAG_NODE_COLLISION")
+        if set(self.dependencies) != result_ids:
+            raise ValueError("DEPENDENCY_DAG_RESULT_NODE_SET_MISMATCH")
+        for artifact in self.artifacts.values():
+            if isinstance(artifact, RegisteredArtifact):
+                if not trust_root.authorizes(artifact):
+                    raise ValueError("ARTIFACT_TRUST_POLICY_REJECTED")
+            elif _artifact_digest(artifact) is None:
+                raise ValueError("ARTIFACT_CONTENT_HASH_INVALID")
+        known = artifact_ids | result_ids
+        graph: dict[str, tuple[str, ...]] = {}
+        for result_id, result in self.results.items():
+            declared = self.dependencies[result_id]
+            if tuple(sorted(set(declared))) != tuple(declared):
+                raise ValueError("DEPENDENCY_DAG_NONCANONICAL_EDGES")
+            if set(declared) != set(result.dependency_record_ids):
+                raise ValueError("DEPENDENCY_DAG_RESULT_EDGE_MISMATCH")
+            if any(dep not in known or dep == result_id for dep in declared):
+                raise ValueError("DEPENDENCY_DAG_UNKNOWN_OR_SELF_EDGE")
+            hashes = dict(result.dependency_hashes)
+            for dep in declared:
+                actual = (_artifact_digest(self.artifacts[dep])
+                          if dep in artifact_ids
+                          else self.results[dep].computation_artifact_hash)
+                if actual is None or hashes.get(dep) != actual:
+                    raise ValueError("DEPENDENCY_DAG_HASH_MISMATCH")
+            synthetic_dependency = (trust_root.synthetic_only or any(
+                dep in result_ids and self.results[dep].synthetic_provenance
+                for dep in declared))
+            if synthetic_dependency and not result.synthetic_provenance:
+                raise ValueError("SYNTHETIC_PROVENANCE_INVALID")
+            if (result.producer_kind == _SETTLEMENT_PRODUCER
+                    and not _valid_settlement_seal(result)):
+                raise ValueError("SETTLEMENT_PROVENANCE_INVALID")
+            graph[result_id] = declared
+        visiting: set[str] = set()
+        visited: set[str] = set()
+        def visit(node: str) -> None:
+            if node in visited or node in artifact_ids:
+                return
+            if node in visiting:
+                raise ValueError("DEPENDENCY_DAG_CYCLE")
+            visiting.add(node)
+            for dep in graph[node]:
+                visit(dep)
+            visiting.remove(node)
+            visited.add(node)
+        for node in result_ids:
+            visit(node)
+
+    def validate_current(self, result_id: str) -> bool:
+        """Require the complete transitive result subgraph to be consumable."""
+        if type(self) is not ArtifactRegistry:
+            return False
+        try:
+            self.validate_closed_dag()
+        except ValueError:
+            return False
+        visiting: set[str] = set()
+        def current(node: str) -> bool:
+            if node in visiting:
+                return False
+            result = self.results.get(node)
+            if result is None or not result.consumable():
+                return False
+            visiting.add(node)
+            try:
+                for dep in self.dependencies[node]:
+                    if dep in self.results:
+                        if not current(dep):
+                            return False
+                    else:
+                        artifact = self.artifacts.get(dep)
+                        if (isinstance(artifact, RegisteredArtifact)
+                                and not self.trust_root.authorizes(artifact)):
+                            return False
+                        if _artifact_digest(artifact) != dict(result.dependency_hashes).get(dep):
+                            return False
+                return True
+            finally:
+                visiting.remove(node)
+        return current(result_id)
+
+    def with_result(self, result_id: str, result: MaterialResult) -> "ArtifactRegistry":
+        if type(self) is not ArtifactRegistry:
+            raise ValueError("ARTIFACT_REGISTRY_EXACT_TYPE_REQUIRED")
+        self.validate_closed_dag()
+        if result_id in self.artifacts or result_id in self.results:
+            raise ValueError("duplicate result identity")
+        results = dict(self.results)
+        results[result_id] = result
+        dependencies = dict(self.dependencies)
+        dependencies[result_id] = tuple(result.dependency_record_ids)
+        return ArtifactRegistry(dict(self.artifacts), dependencies, results,
+                                self.trust_root)
+
+    def select_transaction(self, record_id: str, new_hash: str) -> "ArtifactRegistry":
+        if type(self) is not ArtifactRegistry:
+            raise ValueError("ARTIFACT_REGISTRY_EXACT_TYPE_REQUIRED")
+        self.validate_closed_dag()
+        if record_id not in self.artifacts or not valid_sha256(new_hash):
+            raise ValueError("invalid dependency transaction")
+        existing = self.artifacts[record_id]
+        if isinstance(existing, RegisteredArtifact):
+            raise ValueError("registered immutable content cannot be replaced by a bare hash")
+        descendants = {record_id}
+        changed = True
+        while changed:
+            changed = False
+            for node, deps in self.dependencies.items():
+                if node not in descendants and descendants.intersection(deps):
+                    descendants.add(node)
+                    changed = True
+        stale = {key: (replace(value, freshness=Freshness.STALE)
+                       if key in descendants else value)
+                 for key, value in self.results.items()}
+        artifacts = dict(self.artifacts)
+        artifacts[record_id] = new_hash
+        updated = object.__new__(ArtifactRegistry)
+        object.__setattr__(updated, "artifacts", artifacts)
+        object.__setattr__(updated, "dependencies", dict(self.dependencies))
+        object.__setattr__(updated, "results", stale)
+        object.__setattr__(updated, "trust_root", self.trust_root)
+        return updated
+
+
+def _require_exact_registry(registry: Any) -> tuple[ArtifactRegistry, ArtifactTrustRoot]:
+    """Validate the exact registry class, exact root class, fixed manifest, and DAG."""
+    if type(registry) is not ArtifactRegistry:
+        raise ValueError("ARTIFACT_REGISTRY_EXACT_TYPE_REQUIRED")
+    root = _require_exact_trust_root(registry.trust_root)
+    registry.validate_closed_dag()
+    return registry, root
+
+
+def artifact_registry(records: Sequence[RegisteredArtifact],
+                      results: Mapping[str, MaterialResult] = {},
+                      dependencies: Optional[Mapping[str, tuple[str, ...]]] = None,
+                      *, trust_root: Optional[ArtifactTrustRoot] = None
+                      ) -> ArtifactRegistry:
+    by_id = {record.artifact_id: record for record in records}
+    if len(by_id) != len(records):
+        raise ValueError("duplicate artifact identity")
+    if records and trust_root is None:
+        raise ValueError("independently provisioned artifact trust root required")
+    selected_root = (empty_trust_root() if trust_root is None
+                     else _require_exact_trust_root(trust_root))
+    deps = ({key: tuple(result.dependency_record_ids)
+             for key, result in results.items()} if dependencies is None
+            else dict(dependencies))
+    return ArtifactRegistry(by_id, deps, dict(results), selected_root)
+
+
+def consume_registered(registry: ArtifactRegistry, result_id: str) -> MaterialResult:
+    try:
+        exact_registry, _ = _require_exact_registry(registry)
+    except (TypeError, ValueError):
+        exact_registry = None
+    if exact_registry is None or not exact_registry.validate_current(result_id):
+        return material_result(ExplicitAbsence((result_id,),
+                               "transitive dependency graph is stale, untrusted, or unconsumable"),
+                               Availability.UNAVAILABLE,
+                               diagnostics=("STALE_RESULT_CONSUMPTION",))
+    return exact_registry.results[result_id]
+
+
+# Actual corrected production API for requirement 3.2.  Battery voltage is accepted
+# only as contextual provenance and cannot rescale the fixed physical turns ratio.
+def fixed_ratio_primary_current(primary_turns: int, secondary_turns: int,
+                                secondary_current_rms: int | Fraction | str,
+                                *, battery_voltage: int | Fraction | str
+                                ) -> CanonicalNumber:
+    if (type(primary_turns) is not int or type(secondary_turns) is not int
+            or primary_turns <= 0 or secondary_turns <= 0):
+        raise ValueError("positive integer transformer turns required")
+    current = Fraction(secondary_current_rms)
+    voltage = Fraction(battery_voltage)
+    if current < 0 or voltage <= 0:
+        raise ValueError("physical current/voltage domain invalid")
+    physical_ratio = Fraction(secondary_turns, primary_turns)
+    return CanonicalNumber.rational(current * physical_ratio,
+                                    "CURRENT", "A")
+
+
+_ATS_ARTIFACT_SCHEMA = {"artifact_id","version","artifact_hash","owner",
+                        "approval","applicability","expired"}
+_THRESHOLD_ARTIFACT_SCHEMA = {"artifact_id","version","artifact_hash","owner",
+    "approved","W_seconds","ires_max","vsperiod_max","vscum_max",
+    "estored_max","closed_energy_sources","methods_complete"}
+_OBSERVATION_ARTIFACT_SCHEMA = {"window_seconds","ires_rms","vs_per_period",
+    "vs_cumulative","end_energy","energy_sources"}
+
+
+def registered_ats(ats: ATSv2) -> RegisteredArtifact:
+    return RegisteredArtifact.create(ats.artifact_id, ats.version, "ATS_V2",
+        _ats_content(ats), owner="InverterOwner",
+        approval="SPEC_NORMATIVE_APPROVAL")
+
+
+def registered_thresholds(thresholds: ProductThresholds) -> RegisteredArtifact:
+    content = {key: (str(value) if isinstance(value, Fraction) else value)
+               for key, value in thresholds.__dict__.items()}
+    return RegisteredArtifact.create(thresholds.artifact_id, thresholds.version,
+        "PRODUCT_THRESHOLDS", content, owner="InverterOwner",
+        approval="APPROVED")
+
+
+def registered_settling_observations(artifact_id: str,
+        observations: Mapping[str, Any]) -> RegisteredArtifact:
+    content = {"window_seconds":str(Fraction(observations["window_seconds"])),
+        "ires_rms":str(Fraction(observations["ires_rms"])),
+        "vs_per_period":[str(Fraction(v)) for v in observations["vs_per_period"]],
+        "vs_cumulative":str(Fraction(observations["vs_cumulative"])),
+        "end_energy":str(Fraction(observations["end_energy"])),
+        "energy_sources":list(observations["energy_sources"])}
+    return RegisteredArtifact.create(artifact_id, "1.0.0",
+        "SETTLING_OBSERVATIONS", content, owner="IndependentTestOwner",
+        approval="APPROVED")
+
+
+@dataclass(frozen=True)
+class SettlementClassification:
+    state: str
+    decision: MaterialResult
+    registry: ArtifactRegistry
+    result_id: str
+
+    def __iter__(self):
+        # Preserve historical two-value unpacking while exposing the registry proof.
+        yield self.state
+        yield self.decision
+
+
+def _unavailable_settlement(reason: str, diagnostics: Sequence[str],
+                            registry: Optional[ArtifactRegistry], result_id: str
+                            ) -> SettlementClassification:
+    try:
+        base, root = (_require_exact_registry(registry)
+                      if registry is not None
+                      else (artifact_registry([]), empty_trust_root()))
+    except (TypeError, ValueError):
+        base, root = artifact_registry([]), empty_trust_root()
+    result = _seal_settlement(material_result(
+        {"decision_type":"SETTLEMENT_DECISION","state":"TRANSITION",
+         "passed":False,"reason":reason}, Availability.UNAVAILABLE,
+        diagnostics=diagnostics, non_gating=True,
+        synthetic_provenance=root.synthetic_only,
+        suffix="settlement-unavailable"))
+    try:
+        registered = base.with_result(result_id, result)
+    except ValueError:
+        registered = base
+    return SettlementClassification("TRANSITION", result, registered, result_id)
+
+
+def classify_settling(*, caller_settled: Optional[bool], ats: Optional[ATSv2],
+                       thresholds: Optional[ProductThresholds], period: Fraction,
+                       observations: Optional[Mapping[str,Any]],
+                       registry: Optional[ArtifactRegistry] = None,
+                       ats_ref: Any = None, thresholds_ref: Any = None,
+                       observations_ref: Any = None,
+                       result_id: str = "settlement-decision"
+                       ) -> SettlementClassification:
+    if caller_settled is not None:
+        return _unavailable_settlement("caller flag rejected",
+            ("CALLER_SETTLED_REJECTED",), registry, result_id)
+    try:
+        if registry is None:
+            raise ValueError("trusted registry required")
+        registry, trust_root = _require_exact_registry(registry)
+        ats_artifact = registry.resolve(ats_ref, "ATS_V2", _ATS_ARTIFACT_SCHEMA)
+        threshold_artifact = registry.resolve(thresholds_ref,
+            "PRODUCT_THRESHOLDS", _THRESHOLD_ARTIFACT_SCHEMA)
+        observation_artifact = registry.resolve(observations_ref,
+            "SETTLING_OBSERVATIONS", _OBSERVATION_ARTIFACT_SCHEMA)
+        if ats is None or thresholds is None or observations is None:
+            raise ValueError("typed policy, thresholds, and observations required")
+        if canonical_json(ats_artifact.content) != canonical_json(_ats_content(ats)):
+            raise ValueError("ATS content mismatch")
+        threshold_content = {key:(str(value) if isinstance(value,Fraction) else value)
+                             for key,value in thresholds.__dict__.items()}
+        if canonical_json(threshold_artifact.content) != canonical_json(threshold_content):
+            raise ValueError("threshold content mismatch")
+        expected_observations = registered_settling_observations(
+            observation_artifact.artifact_id, observations).content
+        if canonical_json(observation_artifact.content) != canonical_json(expected_observations):
+            raise ValueError("observation content mismatch")
+        if not ats.usable_for("CANONICAL_EQUALITY") or not thresholds.valid(period):
+            raise ValueError("policy or thresholds invalid")
+        if tuple(observations["energy_sources"]) != thresholds.closed_energy_sources:
+            raise ValueError("stored-energy source set mismatch")
+        comparisons={"window":Fraction(observations["window_seconds"])>=thresholds.W_seconds,
+                     "ires":Fraction(observations["ires_rms"])<=thresholds.ires_max,
+                     "vsperiod":all(abs(Fraction(v))<=thresholds.vsperiod_max for v in observations["vs_per_period"]),
+                     "vscum":abs(Fraction(observations["vs_cumulative"]))<=thresholds.vscum_max,
+                     "energy":Fraction(observations["end_energy"])<=thresholds.estored_max}
+        state="SETTLED" if all(comparisons.values()) else "TRANSITION"
+        value={"decision_type":"SETTLEMENT_DECISION","state":state,
+               "passed":all(comparisons.values()),"comparisons":comparisons,
+               "ats_ref":ats_artifact.ref,"thresholds_ref":threshold_artifact.ref,
+               "observations_ref":observation_artifact.ref}
+        decision=_seal_settlement(material_result(value,
+            dependency_records={ats_artifact.artifact_id:ats_artifact.artifact_hash,
+                threshold_artifact.artifact_id:threshold_artifact.artifact_hash,
+                observation_artifact.artifact_id:observation_artifact.artifact_hash},
+            non_gating=trust_root.synthetic_only,
+            synthetic_provenance=trust_root.synthetic_only,
+            suffix="classify-settling"))
+        registered=registry.with_result(result_id,decision)
+        return SettlementClassification(state,decision,registered,result_id)
+    except Exception as exc:
+        return _unavailable_settlement(str(exc),
+            ("PRODUCT_THRESHOLD_UNAVAILABLE",), registry, result_id)
+
+
+def no_load_report(settlement_result_id: str, p: int, polarity: int,
+                   residual: MaterialResult, *, registry: ArtifactRegistry
+                   ) -> tuple[MaterialResult,...]:
+    registry, trust_root = _require_exact_registry(registry)
+    if not registry.validate_current(settlement_result_id):
+        raise ValueError("FRESH_REGISTRY_SETTLEMENT_DECISION_REQUIRED")
+    settlement_decision=registry.results[settlement_result_id]
+    if not _valid_settlement_seal(settlement_decision):
+        raise ValueError("CLASSIFY_SETTLING_PROVENANCE_REQUIRED")
+    decision=settlement_decision.canonical_value
+    if (not isinstance(decision,Mapping)
+            or decision.get("decision_type")!="SETTLEMENT_DECISION"
+            or decision.get("state") not in {"SETTLED","TRANSITION"}):
+        raise ValueError("VALIDATED_SETTLEMENT_DECISION_REQUIRED")
+    try:
+        ats_artifact=registry.resolve(decision["ats_ref"],"ATS_V2",_ATS_ARTIFACT_SCHEMA)
+        threshold_artifact=registry.resolve(decision["thresholds_ref"],"PRODUCT_THRESHOLDS",_THRESHOLD_ARTIFACT_SCHEMA)
+        observation_artifact=registry.resolve(decision["observations_ref"],"SETTLING_OBSERVATIONS",_OBSERVATION_ARTIFACT_SCHEMA)
+    except Exception as exc:
+        raise ValueError("TRUSTED_SETTLEMENT_DEPENDENCIES_REQUIRED") from exc
+    expected_deps={ats_artifact.artifact_id,threshold_artifact.artifact_id,
+                   observation_artifact.artifact_id}
+    if set(settlement_decision.dependency_record_ids)!=expected_deps:
+        raise ValueError("SETTLEMENT_DEPENDENCY_BINDING_INVALID")
+    if (decision["state"]=="SETTLED"
+            and (settlement_decision.availability is not Availability.AVAILABLE
+                 or decision.get("passed") is not True)):
+        raise ValueError("AVAILABLE_PASSING_SETTLEMENT_REQUIRED")
+    state=decision["state"]
+    rows=[]
+    for category in NO_LOAD_CATEGORIES:
+        if category=="INTENTIONAL_IDEAL_DIFFERENTIAL_TRANSFER" and p==0:
+            availability,value,basis=Availability.AVAILABLE,CanonicalNumber.rational(0,"POWER","W"),"CALCULATED_ESTIMATE"
+        elif category=="UNINTENDED_DIFFERENTIAL_RESIDUAL":
+            availability,value,basis=residual.availability,residual.canonical_value,"CALCULATED_ESTIMATE"
+        else:
+            availability,value,basis=Availability.UNAVAILABLE,ExplicitAbsence((category,),"no admissible evaluable model/evidence"),"NONE"
+        record={"category":category,"applicability":"APPLICABLE","result_basis":basis,
+                "p":p,"polarity":polarity,"elapsed_time":ExplicitAbsence(("elapsed_time",),"not evidenced"),
+                "state":state,"observation_window":threshold_artifact.content["W_seconds"],
+                "threshold_artifact":threshold_artifact.ref,"carrier_state":"ENABLED",
+                "gate_state":"ENABLED","provenance_artifact":settlement_result_id,
+                "uncertainty_or_bound":residual.uncertainty_or_bound if category=="UNINTENDED_DIFFERENTIAL_RESIDUAL" else None,
+                "canonical_value":value}
+        deps=(settlement_decision,residual) if category=="UNINTENDED_DIFFERENTIAL_RESIDUAL" else (settlement_decision,)
+        rows.append(material_result(record,availability,dependencies=deps,
+            non_gating=trust_root.synthetic_only or availability is Availability.UNAVAILABLE,
+            synthetic_provenance=(settlement_decision.synthetic_provenance
+                                  or residual.synthetic_provenance),
+            suffix="no-load:"+category))
+    return tuple(rows)
+
+
+# Comparison prerequisite artifacts have policy-valid metadata but still require an
+# independently supplied trust-root grant before they can authorize progression.
+def _embedded_artifact(artifact_type: str,
+                       content: Mapping[str,Any]) -> RegisteredArtifact:
+    return RegisteredArtifact.create(artifact_type+"-"+content_hash(content)[:16],
+        "1.0.0", artifact_type, content, owner="InverterOwner",
+        approval="APPROVED")
+
+
+def build_comparison_registry(t_ref: Mapping[str,Any],
+                              artifacts: Sequence[Mapping[str,Any]], *,
+                              realistic_execution_at: int=10,
+                              prerequisite_trust_root: Optional[ArtifactTrustRoot]=None
+                              ) -> ComparisonArtifactRegistry:
+    clean_artifacts=[]; prereqs=[]
+    for artifact in artifacts:
+        clean={key:copy.deepcopy(value) for key,value in artifact.items()
+               if key!="_registered_prerequisite"}
+        registered=artifact.get("_registered_prerequisite")
+        if isinstance(registered,RegisteredArtifact):
+            prereqs.append(registered)
+        clean_artifacts.append(clean)
+    unique={record.artifact_id:record for record in prereqs}
+    if len(unique)!=len(prereqs):
+        raise ValueError("conflicting duplicate prerequisite identity")
+    prereg=artifact_registry(list(unique.values()),
+        trust_root=prerequisite_trust_root)
+    body={"registry_id":"COMPARISON-REGISTRY-003","t_ref":copy.deepcopy(dict(t_ref)),
+          "artifacts":clean_artifacts,
+          "prerequisite_hashes":sorted((r.artifact_id,r.artifact_hash) for r in unique.values()),
+          "t_ref_frozen_at":1,"gate_frozen_at":[a.get("frozen_at") for a in clean_artifacts],
+          "realistic_execution_at":realistic_execution_at}
+    return ComparisonArtifactRegistry(body["registry_id"],body["t_ref"],
+        tuple(clean_artifacts),prereg,1,tuple(body["gate_frozen_at"]),
+        realistic_execution_at,content_hash(body))
