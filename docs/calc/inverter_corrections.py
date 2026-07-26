@@ -17,6 +17,7 @@ from enum import Enum
 from fractions import Fraction
 from itertools import product
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -169,22 +170,50 @@ class GateAuthorization:
     synthetic_provenance: bool = False
 
     def __post_init__(self) -> None:
-        if type(self.synthetic_provenance) is not bool:
-            raise ValueError("synthetic authorization provenance must be boolean")
+        _gate_authorization_state(self)
 
     @property
     def synthetic_only(self) -> bool:
-        """Compatibility name for callers that display fixture-only authorization."""
-        return self.synthetic_provenance
+        """Compatibility name backed by validated immutable instance state."""
+        return _gate_authorization_state(self)["synthetic_provenance"]
 
     def authorizes(self, operation: str) -> bool:
-        if not self.valid or self.operation != operation:
-            return False
-        if self.permitted_ineligibility:
-            return operation == "PROGRESS_TO_REALISTIC_COMPARISON" and not any(
-                (self.completion_claim, self.pass_claim, self.success_claim)
-            )
-        return True
+        return _gate_authorization_authorizes(
+            _gate_authorization_state(self), operation)
+
+
+def _gate_authorization_state(authorization: Any) -> Mapping[str, Any]:
+    """Snapshot authorization state without invoking class descriptors/methods."""
+    if type(authorization) is not GateAuthorization:
+        raise ValueError("GATE_AUTHORIZATION_EXACT_TYPE_REQUIRED")
+    state = object.__getattribute__(authorization, "__dict__")
+    expected = {"gate", "operation", "valid", "permitted_ineligibility",
+                "completion_claim", "pass_claim", "success_claim",
+                "diagnostic", "synthetic_provenance"}
+    if type(state) is not dict or set(state) != expected:
+        raise ValueError("GATE_AUTHORIZATION_STATE_INVALID")
+    snapshot = dict(state)
+    if (type(snapshot["gate"]) is not GateIdentity
+            or type(snapshot["operation"]) is not str
+            or not snapshot["operation"]
+            or any(type(snapshot[name]) is not bool for name in
+                   ("valid", "permitted_ineligibility", "completion_claim",
+                    "pass_claim", "success_claim", "synthetic_provenance"))
+            or (snapshot["diagnostic"] is not None
+                and type(snapshot["diagnostic"]) is not str)):
+        raise ValueError("GATE_AUTHORIZATION_STATE_INVALID")
+    return MappingProxyType(snapshot)
+
+
+def _gate_authorization_authorizes(state: Mapping[str, Any],
+                                    operation: str) -> bool:
+    if not state["valid"] or state["operation"] != operation:
+        return False
+    if state["permitted_ineligibility"]:
+        return (operation == "PROGRESS_TO_REALISTIC_COMPARISON"
+                and not any(state[name] for name in
+                            ("completion_claim", "pass_claim", "success_claim")))
+    return True
 
 
 @dataclass(frozen=True)
@@ -284,15 +313,30 @@ def derive_result(
     bound: Any = None,
     unrelated: bool = False,
 ) -> MaterialResult:
-    synthetic_authorization = (not unrelated and any(
-        auth.synthetic_provenance for auth in gate_authorizations))
-    if not unrelated and operation:
-        for auth in gate_authorizations:
-            if not auth.authorizes(operation):
+    authorization_states: tuple[Mapping[str, Any], ...] = ()
+    if not unrelated:
+        try:
+            authorization_states = tuple(
+                _gate_authorization_state(auth) for auth in gate_authorizations)
+        except (TypeError, ValueError):
+            return material_result(
+                ExplicitAbsence(("workflow_authorization",),
+                                "malformed workflow authorization"),
+                Availability.UNAVAILABLE, dependencies=required,
+                diagnostics=("INVALID_WORKFLOW_AUTHORIZATION",),
+                non_gating=True, suffix="authorization-malformed")
+    synthetic_authorization = any(
+        state["synthetic_provenance"] for state in authorization_states)
+    if operation:
+        for state in authorization_states:
+            if not _gate_authorization_authorizes(state, operation):
                 return material_result(
-                    ExplicitAbsence((auth.gate.value,), "invalid workflow authorization"),
+                    ExplicitAbsence((state["gate"].value,),
+                                    "invalid workflow authorization"),
                     Availability.UNAVAILABLE, dependencies=required,
-                    diagnostics=(auth.diagnostic or "INVALID_WORKFLOW_AUTHORIZATION",),
+                    diagnostics=(state["diagnostic"]
+                                 or "INVALID_WORKFLOW_AUTHORIZATION",),
+                    non_gating=True,
                     synthetic_provenance=synthetic_authorization,
                     suffix="authorization-blocked",
                 )
@@ -1179,13 +1223,24 @@ def validate_comparison_registry(t_ref: Mapping[str,Any], artifacts: Sequence[Ma
         ineligible = outcome["kind"] == "INELIGIBILITY"
         auths.append(GateAuthorization(gate,"PROGRESS_TO_REALISTIC_COMPARISON",True,ineligible,
                                        outcome.get("completion_claim",False),outcome.get("pass_claim",False),outcome.get("success_claim",False)))
-    return tuple(sorted(auths,key=lambda a:a.gate.value)),()
+    return tuple(sorted(auths,key=lambda a:_gate_authorization_state(a)["gate"].value)),()
 
 
 def realistic_comparison_result(local_value: Any, local_inputs: Sequence[MaterialResult], direct_evidence_complete: bool,
                                 local_conditions_satisfied: bool, authorizations: Sequence[GateAuthorization],
                                 *, real_claim: bool = False) -> MaterialResult:
-    synthetic = (any(auth.synthetic_provenance for auth in authorizations)
+    try:
+        authorization_states = tuple(
+            _gate_authorization_state(auth) for auth in authorizations)
+    except (TypeError, ValueError):
+        return material_result(
+            ExplicitAbsence(("workflow_authorization",),
+                            "malformed workflow authorization"),
+            Availability.UNAVAILABLE, dependencies=local_inputs,
+            diagnostics=("INVALID_WORKFLOW_AUTHORIZATION",),
+            non_gating=True, suffix="comparison-authorization-malformed")
+    synthetic = (any(state["synthetic_provenance"]
+                     for state in authorization_states)
                  or any(getattr(item, "synthetic_provenance", False)
                         for item in local_inputs))
     if real_claim and synthetic:
@@ -1910,7 +1965,7 @@ def validate_comparison_registry(t_ref_or_registry: Mapping[str,Any] | Compariso
         gate=GateIdentity(artifact["gate"]); outcome=artifact["outcomes"][0]; ineligible=outcome["kind"]=="INELIGIBILITY"
         auths.append(GateAuthorization(gate,"PROGRESS_TO_REALISTIC_COMPARISON",True,ineligible,
                                        outcome.get("completion_claim",False),outcome.get("pass_claim",False),outcome.get("success_claim",False)))
-    return tuple(sorted(auths,key=lambda a:a.gate.value)),()
+    return tuple(sorted(auths,key=lambda a:_gate_authorization_state(a)["gate"].value)),()
 
 
 
@@ -2475,7 +2530,7 @@ def validate_comparison_registry(registry: Any, artifacts: Sequence[Mapping[str,
                                       outcome.get("completion_claim",False),outcome.get("pass_claim",False),outcome.get("success_claim",False),
                                       synthetic_provenance=_authenticated_trust_root_classification(
                                           registry.prerequisite_registry.trust_root)))
-    return tuple(sorted(auth,key=lambda x:x.gate.value)),()
+    return tuple(sorted(auth,key=lambda x:_gate_authorization_state(x)["gate"].value)),()
 
 
 # Thermal decisions consume the physical data inside one registered immutable artifact.

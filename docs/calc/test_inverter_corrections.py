@@ -705,6 +705,46 @@ class IndependentReviewRegressionTests(unittest.TestCase):
                 {"synthetic-node":(),"wrapper":("synthetic-node",)},
                 {"synthetic-node":synthetic_node,"wrapper":laundering_wrapper})
 
+    def test_gate_authorization_descriptors_cannot_launder_trust_state(self):
+        """**Validates: Requirements 2.39, 2.41**"""
+        authorization=GateAuthorization(GateIdentity.CONTROLLED_THREEFOLD,
+            "PROGRESS_TO_REALISTIC_COMPARISON",True,
+            synthetic_provenance=True)
+        class ForgedAuthorization(GateAuthorization):
+            pass
+        forged=object.__new__(ForgedAuthorization)
+        for name,value in object.__getattribute__(authorization,"__dict__").items():
+            object.__setattr__(forged,name,value)
+        original_descriptor=GateAuthorization.synthetic_provenance
+        try:
+            GateAuthorization.synthetic_provenance=property(lambda self: False)
+            self.assertFalse(authorization.synthetic_provenance)
+            self.assertTrue(authorization.synthetic_only)
+            self.assertTrue(authorization.authorizes(
+                "PROGRESS_TO_REALISTIC_COMPARISON"))
+
+            derived=derive_result((),1,direct_evidence_complete=True,
+                local_conditions_satisfied=True,
+                gate_authorizations=(authorization,),
+                operation="PROGRESS_TO_REALISTIC_COMPARISON")
+            self.assertEqual(derived.availability,Availability.AVAILABLE)
+            self.assertTrue(derived.synthetic_provenance)
+            self.assertTrue(derived.non_gating)
+
+            claim=realistic_comparison_result(1,(),True,True,
+                (authorization,),real_claim=True)
+            self.assertEqual(claim.availability,Availability.UNAVAILABLE)
+            self.assertTrue(claim.synthetic_provenance)
+            self.assertTrue(claim.non_gating)
+
+            class_result=realistic_comparison_result(1,(),True,True,(forged,))
+            self.assertEqual(class_result.availability,Availability.UNAVAILABLE)
+            self.assertTrue(class_result.non_gating)
+            self.assertIn("INVALID_WORKFLOW_AUTHORIZATION",
+                          class_result.diagnostics)
+        finally:
+            GateAuthorization.synthetic_provenance=original_descriptor
+
     def test_repository_constants_cannot_mint_or_modify_grants(self):
         """Copied metadata, hashes, and every public constant are not authority."""
         root=synthetic_fixture_trust_root()
